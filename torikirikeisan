@@ -1,0 +1,461 @@
+Option Explicit
+
+Public Sub FindNumberCombination()
+
+    Const TARGET_CELL As String = "A2"
+    Const VALUE_COLUMN As Long = 2          'B列
+    Const FIRST_VALUE_ROW As Long = 2
+    Const RESULT_SHEET As String = "組合せ結果"
+
+    '結果が多すぎる場合の安全上限
+    Const MAX_UNIQUE_VALUES As Long = 200000
+
+    Dim src As Worksheet
+    Dim dst As Worksheet
+    Dim wb As Workbook
+
+    Dim target As Double
+    Dim lowerLimit As Double
+    Dim upperLimit As Double
+
+    Dim lastRow As Long
+    Dim r As Long
+    Dim i As Long
+    Dim n As Long
+    Dim k As Long
+    Dim outputRow As Long
+
+    Dim rawValue As Variant
+    Dim candidateValue As Double
+    Dim newSum As Double
+    Dim currentSum As Double
+    Dim bestSum As Double
+
+    Dim values() As Double
+    Dim sourceRows() As Long
+    Dim sourceCells() As String
+    Dim selected() As Boolean
+
+    Dim reachable As Object
+    Dim previousSum As Object
+    Dim usedItem As Object
+
+    Dim keyArray As Variant
+
+    On Error GoTo ErrorHandler
+
+    Set src = ActiveSheet
+    Set wb = src.Parent
+
+    If src.Name = RESULT_SHEET Then
+        MsgBox "数字が入力されているシートを選択してから実行してください。", _
+               vbExclamation
+        Exit Sub
+    End If
+
+    '==================================================
+    ' A1の目標値を確認
+    '==================================================
+    rawValue = src.Range(TARGET_CELL).Value
+
+    If IsError(rawValue) Then
+        MsgBox TARGET_CELL & "に正しい目標値を入力してください。", _
+               vbExclamation
+        Exit Sub
+    End If
+
+    If Not IsNumeric(rawValue) Then
+        MsgBox TARGET_CELL & "に目標となる数字を入力してください。", _
+               vbExclamation
+        Exit Sub
+    End If
+
+    target = CDbl(rawValue)
+
+    If target <= 10 Or target <> Fix(target) Then
+        MsgBox TARGET_CELL & "には11以上の整数を入力してください。", _
+               vbExclamation
+        Exit Sub
+    End If
+
+    'A1より10少ない値～5少ない値
+    lowerLimit = target - 10
+    upperLimit = target - 5
+
+    '==================================================
+    ' B列の数字を読み込む
+    '==================================================
+    lastRow = src.Cells(src.Rows.Count, VALUE_COLUMN).End(xlUp).Row
+
+    If lastRow < FIRST_VALUE_ROW Then
+        MsgBox "B列に数字が入力されていません。", vbExclamation
+        Exit Sub
+    End If
+
+    ReDim values(1 To lastRow - FIRST_VALUE_ROW + 1)
+    ReDim sourceRows(1 To lastRow - FIRST_VALUE_ROW + 1)
+    ReDim sourceCells(1 To lastRow - FIRST_VALUE_ROW + 1)
+
+    For r = FIRST_VALUE_ROW To lastRow
+
+        rawValue = src.Cells(r, VALUE_COLUMN).Value
+
+        If IsError(rawValue) Then
+
+            MsgBox src.Cells(r, VALUE_COLUMN).Address(False, False) & _
+                   "にエラー値があります。", vbExclamation
+            Exit Sub
+
+        ElseIf Len(Trim$(CStr(rawValue))) > 0 Then
+
+            If Not IsNumeric(rawValue) Then
+                MsgBox src.Cells(r, VALUE_COLUMN).Address(False, False) & _
+                       "に数字以外が入力されています。", vbExclamation
+                Exit Sub
+            End If
+
+            candidateValue = CDbl(rawValue)
+
+            'B列は正の整数のみ
+            If candidateValue <= 0 Or _
+               candidateValue <> Fix(candidateValue) Then
+
+                MsgBox src.Cells(r, VALUE_COLUMN).Address(False, False) & _
+                       "には正の整数を入力してください。", vbExclamation
+                Exit Sub
+            End If
+
+            n = n + 1
+            values(n) = candidateValue
+            sourceRows(n) = r
+            sourceCells(n) = _
+                src.Cells(r, VALUE_COLUMN).Address(False, False)
+
+        End If
+
+    Next r
+
+    If n = 0 Then
+        MsgBox "B列に有効な数字がありません。", vbExclamation
+        Exit Sub
+    End If
+
+    '==================================================
+    ' B列から作成可能な合計値を計算
+    '==================================================
+    Set reachable = CreateObject("Scripting.Dictionary")
+    Set previousSum = CreateObject("Scripting.Dictionary")
+    Set usedItem = CreateObject("Scripting.Dictionary")
+
+    '何も選ばない場合の合計0
+    reachable.Add 0#, True
+
+    For i = 1 To n
+
+        '現在存在する合計値をコピー
+        '同じB列の数字を2回使用しないために必要
+        keyArray = reachable.Keys
+
+        For k = LBound(keyArray) To UBound(keyArray)
+
+            newSum = CDbl(keyArray(k)) + values(i)
+
+            'A1を超える値は作らない
+            If newSum <= target Then
+
+                If Not reachable.Exists(newSum) Then
+
+                    If reachable.Count >= MAX_UNIQUE_VALUES Then
+                        MsgBox "作成可能な値が" & _
+                               Format(MAX_UNIQUE_VALUES, "#,##0") & _
+                               "件を超えました。" & vbCrLf & _
+                               "B列の数字を減らして実行してください。", _
+                               vbExclamation
+                        Exit Sub
+                    End If
+
+                    reachable.Add newSum, True
+
+                    'この値を作る直前の合計
+                    previousSum.Add newSum, CDbl(keyArray(k))
+
+                    '最後に使用したB列の数字
+                    usedItem.Add newSum, i
+
+                End If
+
+            End If
+
+        Next k
+
+    Next i
+
+    '==================================================
+    ' A1－10～A1－5に入る値を検索
+    '==================================================
+    bestSum = -1
+    keyArray = reachable.Keys
+
+    For k = LBound(keyArray) To UBound(keyArray)
+
+        currentSum = CDbl(keyArray(k))
+
+        If currentSum >= lowerLimit And _
+           currentSum <= upperLimit Then
+
+            '範囲内でA1に最も近い値を選ぶ
+            If currentSum > bestSum Then
+                bestSum = currentSum
+            End If
+
+        End If
+
+    Next k
+
+    '==================================================
+    ' 結果シートを準備
+    '==================================================
+    On Error Resume Next
+    Set dst = wb.Worksheets(RESULT_SHEET)
+    On Error GoTo ErrorHandler
+
+    If dst Is Nothing Then
+
+        Set dst = wb.Worksheets.Add( _
+            After:=wb.Worksheets(wb.Worksheets.Count))
+
+        dst.Name = RESULT_SHEET
+
+    Else
+
+        If dst.AutoFilterMode Then
+            dst.AutoFilterMode = False
+        End If
+
+        dst.Cells.Clear
+
+    End If
+
+    With dst
+
+        .Range("A1").Value = "目標値"
+        .Range("B1").Value = target
+
+        .Range("A2").Value = "検索範囲"
+        .Range("B2").Value = _
+            Format(lowerLimit, "#,##0") & " ～ " & _
+            Format(upperLimit, "#,##0")
+
+        .Range("A1:A2").Font.Bold = True
+        .Range("B1").NumberFormat = "#,##0"
+
+    End With
+
+    '==================================================
+    ' 範囲内の値が見つかった場合
+    '==================================================
+    If bestSum >= 0 Then
+
+        ReDim selected(1 To n)
+
+        currentSum = bestSum
+
+        '使用されたB列の数字を逆算
+        Do While currentSum > 0
+
+            If Not usedItem.Exists(currentSum) Then
+                MsgBox "組み合わせを復元できませんでした。", _
+                       vbCritical
+                Exit Sub
+            End If
+
+            i = CLng(usedItem(currentSum))
+            selected(i) = True
+
+            currentSum = CDbl(previousSum(currentSum))
+
+        Loop
+
+        With dst
+
+            .Range("A3").Value = "結果"
+            .Range("B3").Value = _
+                "検索範囲内の値が作成できました"
+
+            .Range("A4").Value = "作成値"
+            .Range("B4").Value = bestSum
+
+            .Range("A5").Value = "目標値との差"
+            .Range("B5").Value = target - bestSum
+
+            .Range("A7").Value = "元の行"
+            .Range("B7").Value = "使用したセル"
+            .Range("C7").Value = "数字"
+
+            outputRow = 8
+
+            For i = 1 To n
+
+                If selected(i) Then
+
+                    .Cells(outputRow, 1).Value = sourceRows(i)
+                    .Cells(outputRow, 2).Value = sourceCells(i)
+                    .Cells(outputRow, 3).Value = values(i)
+
+                    outputRow = outputRow + 1
+
+                End If
+
+            Next i
+
+            .Range("A3:A5").Font.Bold = True
+            .Range("A7:C7").Font.Bold = True
+
+            .Range("B4:B5").NumberFormat = "#,##0"
+            .Range("C8:C" & outputRow - 1).NumberFormat = "#,##0"
+
+            .Columns("A:C").AutoFit
+            .Activate
+
+        End With
+
+        MsgBox "検索範囲内の値が見つかりました。" & vbCrLf & _
+               "作成値：" & Format(bestSum, "#,##0") & vbCrLf & _
+               "目標値との差：" & _
+               Format(target - bestSum, "#,##0"), _
+               vbInformation
+
+    '==================================================
+    ' 範囲内の値が作れなかった場合
+    '==================================================
+    Else
+
+        With dst
+
+            .Range("A3").Value = "結果"
+            .Range("B3").Value = _
+                "検索範囲内の値は作成できませんでした"
+
+            .Range("A5").Value = "作成可能な値"
+            .Range("B5").Value = "A1－作成値"
+            .Range("C5").Value = "組み合わせ例"
+
+            outputRow = 6
+            keyArray = reachable.Keys
+
+            For k = LBound(keyArray) To UBound(keyArray)
+
+                currentSum = CDbl(keyArray(k))
+
+                '何も選ばない合計0は表示しない
+                If currentSum > 0 Then
+
+                    .Cells(outputRow, 1).Value = currentSum
+
+                    '作成値はA1以下なので必ず0以上
+                    .Cells(outputRow, 2).Value = _
+                        target - currentSum
+
+                    '数字と＋記号だけを表示
+                    .Cells(outputRow, 3).Value = _
+                        BuildCombinationText( _
+                            currentSum, _
+                            previousSum, _
+                            usedItem, _
+                            values)
+
+                    outputRow = outputRow + 1
+
+                End If
+
+            Next k
+
+            If outputRow > 6 Then
+
+                '作成可能な値を降順に並べ替える
+                .Range("A5:C" & outputRow - 1).Sort _
+                    Key1:=.Range("A6"), _
+                    Order1:=xlDescending, _
+                    Header:=xlYes
+
+                .Range("A6:B" & outputRow - 1).NumberFormat = _
+                    "#,##0"
+
+                .Range("A5:C5").AutoFilter
+
+            Else
+
+                .Range("A6").Value = _
+                    "A1以下で作成可能な値はありません"
+
+            End If
+
+            .Range("A3").Font.Bold = True
+            .Range("A5:C5").Font.Bold = True
+
+            .Columns("A:C").AutoFit
+            .Columns("C").ColumnWidth = 45
+            .Columns("C").WrapText = True
+
+            .Activate
+
+        End With
+
+        MsgBox "検索範囲内の値は作成できませんでした。" & vbCrLf & _
+               "A1以下で作成可能な値を、降順で表示しました。", _
+               vbInformation
+
+    End If
+
+    Exit Sub
+
+ErrorHandler:
+
+    MsgBox "エラーが発生しました。" & vbCrLf & _
+           Err.Description, vbCritical
+
+End Sub
+
+
+Private Function BuildCombinationText( _
+    ByVal sumValue As Double, _
+    ByVal previousSum As Object, _
+    ByVal usedItem As Object, _
+    ByRef values() As Double) As String
+
+    Dim currentSum As Double
+    Dim itemIndex As Long
+    Dim part As String
+    Dim result As String
+
+    currentSum = sumValue
+
+    Do While currentSum > 0
+
+        If Not usedItem.Exists(currentSum) Then
+
+            BuildCombinationText = _
+                "組み合わせを復元できません"
+
+            Exit Function
+
+        End If
+
+        itemIndex = CLng(usedItem(currentSum))
+
+        '数字だけを組み合わせ欄に追加
+        part = Format(values(itemIndex), "#,##0")
+
+        If Len(result) = 0 Then
+            result = part
+        Else
+            result = part & " + " & result
+        End If
+
+        currentSum = CDbl(previousSum(currentSum))
+
+    Loop
+
+    BuildCombinationText = result
+
+End Function
