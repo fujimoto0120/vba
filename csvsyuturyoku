@@ -1,0 +1,64 @@
+Option Explicit
+
+Sub csv出力()
+
+    '--- 保存する範囲を入れる変数 ---
+    Dim saverange As Range
+
+    '--- 新しく作るブックを入れる変数 ---
+    Dim savebook As Workbook
+
+    '--- 保存ダイアログで選ばれたパス（文字列 or False） ---
+    Dim savePath As Variant
+
+    '--- 最終行を入れる変数 ---
+    Dim lastRow As Long
+
+
+    ' ① A列の最終行を自動取得する
+    '    - Rows.Count はシートの最大行数
+    '    - Cells(最大行, "A") から上方向にデータを探す
+    '    - End(xlUp) で最終データ行にジャンプ
+    lastRow = Cells(Rows.Count, "A").End(xlUp).Row
+
+
+    '  保存する範囲を設定
+    '    - A1 から M列の最終行まで
+    '    - 空白があっても関係なく必ず最後まで拾う
+    Set saverange = Range("A1:M" & lastRow)
+
+
+    ' 保存ダイアログを表示して、保存場所＋ファイル名を選ばせる
+    '    - 初期ファイル名は「このブックと同じフォルダの output.csv」
+    '    - CSV だけ選べるようにフィルタを設定
+    savePath = Application.GetSaveAsFilename( _
+                    InitialFileName:=ThisWorkbook.Path & "\output.csv", _
+                    FileFilter:="CSVファイル (*.csv), *.csv")
+
+    ' キャンセルされた場合は処理終了
+    If savePath = False Then Exit Sub
+
+
+    '  新しいブックを作成
+    '    Workbooks.Add で空のブックが1つできる
+    Set savebook = Workbooks.Add
+
+
+    '  保存範囲を新しいブックの A1 に貼り付ける
+    saverange.Copy savebook.Worksheets(1).Range("A1")
+
+
+    ' CSV として保存
+    '    - Filename: ユーザーが選んだ保存パス
+    '    - FileFormat: CSV形式（Shift-JIS）
+
+    savebook.SaveAs Filename:=savePath, FileFormat:=xlCSV
+
+
+ 
+    '  ブックを閉じる
+    '   SaveChanges:=False にすることで
+    '  「保存しますか？」のダイアログを出さない
+    savebook.Close SaveChanges:=False
+
+End Sub
