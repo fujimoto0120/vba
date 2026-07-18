@@ -1,0 +1,41 @@
+option explicit
+
+Sub 最終行を拾う()
+
+Dim ws As Worksheet
+Dim lastcell As Range
+Dim lastrow As Long
+
+Set ws = Sheet1
+
+'最終行を探すコード wsの変数にオブジェクトのシートを指定している
+'lastrowで最終行を格納している。下記のコードはセルの値を返すのではなく、セルそのものを返すコードとなるので
+'findがセルを表すrangeオブジェクトに返すため、range型変数へsetで代入している。
+'ここで代入してファインドを使ってる。findはＥｘｃｅｌのctrl+Fでできるものと同じ機能。改行時にアンダーバーが必要
+'whatで何を探すかを指定する。*はワイルドカードで任意の値を探せる。例えば田中*とすれば田中から始まる言葉を検索できる.
+'*田中にすれば田中で終わる言葉を範囲から検索できる。今回は最終行のため＊のみ
+'*を厳密に説明すると「検索可能な何らかの値があるセルを探す」といった認識です。なので何かが入力されているセルを探せる
+'afterではどこを基準にするかを指定している。
+'lookinは検索条件みたいな。空白セルでも数式が入っていれば返すのがxlFormulasでセルに表示されている値を検索するのがxlvalues
+'lookatは検索方法。完全一致はxlwholeで部分一致でも見つかるならxlpartにする。Excelのやつはxlpartかな？
+'searchOrderは検索する順番かな。xlbyrowsにすると行から検索A50→B50って感じ。もしcolmunsならA1→A2って感じかな。最終行を取るから行でいくよ
+'searchdirectionはどこから検索するか。今回は最後に一致する行を探したいから下から検索している。最初に一致するのを差がしたければxlnext。
+'serchdirectionはxlnextは基準位置から順方向に検索する、xlpreviosで逆方向から。
+
+Set lastcell = ws.Range("a:z").Find( _
+what:="*", _
+after:=ws.Range("A1"), _
+LookIn:=xlValues, _
+lookat:=xlPart, _
+searchorder:=xlByRows, _
+searchdirection:=xlPrevious)
+
+'上記含め、一度lastcellに入れるのは結果がnothingの際も確認ができるようにするため。
+If lastcell Is Nothing Then
+    lastrow = 0
+Else
+    lastrow = lastcell.Row
+End If
+
+MsgBox "最終行は " & lastrow & " 行目です"
+End Sub
