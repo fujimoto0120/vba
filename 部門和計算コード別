@@ -1,0 +1,1655 @@
+Option Explicit
+
+' CSV取込と組合せ計算（改善版）
+'
+' 【処理概要】
+'   1. CSVファイルを選択して読み込む
+'   2. 「商品識別コード」「表示品名」「受注数」の列を探す
+'   3. 商品識別コードの一部を抽出し、コードごとに受注数をまとめる
+'   4. 各コードについて、受注数から作成できる合計値を計算する
+'   5. 取込内容を「出力」シート、計算内容を「計算結果」シートへ出力する
+'
+' 【重要】
+'   出力先には ActiveWorkbook ではなく ThisWorkbook を使用しています。
+'   つまり、このコードを保存しているブックが出力先になります。
+'   PERSONAL.XLSBやアドインへ入れる場合は、対象ブックの指定方法を
+'   運用に合わせて見直してください。
+'＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿
+
+
+' 調整する設定
+
+'CSVの取込結果を表示するシート名
+Private Const IMPORT_SHEET_NAME As String = "出力"
+
+'組合せ計算の結果を表示するシート名
+Private Const RESULT_SHEET_NAME As String = "計算結果"
+
+'商品識別コードから使用部分を取り出す位置と文字数
+'現在は「7文字目から4文字」を抽出する
+Private Const CODE_START_POSITION As Long = 7
+Private Const CODE_CHARACTER_COUNT As Long = 4
+
+'1商品コードにつき作成できる合計値の最大件数
+'部分和の件数は入力内容によって急増するため、Excelの停止を防ぐ上限を設ける
+Private Const MAX_UNIQUE_VALUES As Long = 200000
+
+'読み込むCSVファイルの最大サイズ（50MB）
+'CSV全体をメモリへ読み込む方式なので、極端に大きいファイルを拒否する
+Private Const MAX_CSV_FILE_BYTES As Long = 52428800
+
+'列見出しを探す範囲
+Private Const HEADER_SEARCH_LIMIT As Long = 30
+
+'計算結果を一度にシートへ書き込む件数
+'大きな配列を一括作成しないことで、メモリ使用量を抑える
+Private Const OUTPUT_BATCH_SIZE As Long = 5000
+
+'組合せ例として1セルへ表示する最大文字数
+'Excel自体の上限は32,767文字だが、実用性と処理負荷を考えて短く制限する
+Private Const MAX_COMBINATION_TEXT_LENGTH As Long = 1000
+
+'VBAのDouble型で整数として安全に扱う上限
+'Excelの有効桁数も考慮し、15桁以内に制限する
+Private Const MAX_EXACT_INTEGER As Double = 999999999999999#
+
+'BOMが付いていないCSVはShift-JISとして読み込む
+Private Const DEFAULT_CSV_CHARSET As String = "shift_jis"
+
+
+'===============================================================================
+' メイン処理
+'===============================================================================
+Public Sub CSV取込と組合せ計算()
+
+    Dim csvPath As Variant
+    Dim csvText As String
+    Dim csvRows As Collection
+
+    Dim wsImport As Worksheet
+    Dim wsResult As Worksheet
+
+    Dim groups As Object
+    Dim productNames As Object
+
+    Dim importData() As Variant
+    Dim importCount As Long
+
+    Dim headerRow As Long
+    Dim productCol As Long
+    Dim codeCol As Long
+    Dim quantityCol As Long
+
+    'Excel全体の設定を、実行前と同じ状態へ戻すために保存する
+    Dim previousScreenUpdating As Boolean
+    Dim previousEnableEvents As Boolean
+    Dim previousStatusBar As Variant
+    Dim applicationStateSaved As Boolean
+
+    '終了後に表示するメッセージ
+    Dim noticeMessage As String
+    Dim successMessage As String
+    Dim errorMessage As String
+
+    On Error GoTo ErrorHandler
+
+
+    ' 1. CSVファイルを利用者に選択してもらう
+    csvPath = Application.GetOpenFilename( _
+        FileFilter:="CSVファイル (*.csv),*.csv", _
+        Title:="取り込むCSVファイルを選択してください")
+
+    'キャンセルされた場合は、Excelの状態を変更していないのでそのまま終了する
+    If VarType(csvPath) = vbBoolean Then
+        Exit Sub
+    End If
+
+    'ファイル選択画面のフィルターだけに頼らず、拡張子も確認する
+    If LCase$(Right$(CStr(csvPath), 4)) <> ".csv" Then
+
+        MsgBox _
+            "CSVファイルを選択してください。", _
+            vbExclamation
+
+        Exit Sub
+
+    End If
+
+    'ファイル全体をメモリに読み込むため、事前にサイズを制限する
+    If FileLen(CStr(csvPath)) > MAX_CSV_FILE_BYTES Then
+
+        MsgBox _
+            "CSVファイルが大きすぎます。" & vbCrLf & _
+            "上限：" & Format$(MAX_CSV_FILE_BYTES / 1024# / 1024#, "0") & " MB", _
+            vbExclamation
+
+        Exit Sub
+
+    End If
+
+
+    ' 2. Excel全体の設定を保存してから、一時的に画面更新等を止める
+  
+    previousScreenUpdating = Application.ScreenUpdating
+    previousEnableEvents = Application.EnableEvents
+    previousStatusBar = Application.StatusBar
+    applicationStateSaved = True
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+
+    'DisplayAlertsは無効化しない。
+    'この処理には警告を一律に隠す必要がなく、意図しない警告抑止を避けるため。
+
+    ' 3. CSVを読み込み、行と列へ分解する
+
+    Application.StatusBar = "CSVファイルを読み込んでいます..."
+
+    csvText = ReadCsvText(CStr(csvPath))
+    Set csvRows = ParseCsv(csvText)
+
+    If csvRows.Count = 0 Then
+        noticeMessage = "CSVにデータがありません。"
+        GoTo Cleanup
+    End If
+
+    '必要な3列が同じ行にそろっている場所を探す
+    headerRow = FindHeaderRow( _
+        csvRows, _
+        productCol, _
+        codeCol, _
+        quantityCol)
+
+    If headerRow = 0 Then
+
+        noticeMessage = _
+            "必要な列名が見つかりませんでした。" & _
+            vbCrLf & vbCrLf & _
+            "必要な列名：" & vbCrLf & _
+            "・商品識別コード" & vbCrLf & _
+            "・表示品名" & vbCrLf & _
+            "・受注数"
+
+        GoTo Cleanup
+
+    End If
+
+    If csvRows.Count <= headerRow Then
+        noticeMessage = "CSVに商品データがありません。"
+        GoTo Cleanup
+    End If
+
+    '商品コードをキーとして、受注数と商品名を保持する
+    Set groups = CreateObject("Scripting.Dictionary")
+    groups.CompareMode = vbBinaryCompare
+
+    Set productNames = CreateObject("Scripting.Dictionary")
+    productNames.CompareMode = vbBinaryCompare
+
+
+    ' 4. CSVの全データを検証し、出力用配列と計算用グループを作る
+    '
+    ' この段階では、まだワークシートを消去・変更しない。
+    ' CSVに不正値があった場合、既存の出力結果を残したまま終了できる。
+ 
+    Application.StatusBar = "CSVデータを検証しています..."
+
+    BuildImportData _
+        csvRows, _
+        headerRow, _
+        productCol, _
+        codeCol, _
+        quantityCol, _
+        importData, _
+        importCount, _
+        groups, _
+        productNames
+
+    If importCount = 0 Then
+        noticeMessage = "取り込み可能な商品データがありません。"
+        GoTo Cleanup
+    End If
+
+ 
+    ' 5. 既存の出力シートを確認する
+
+    Set wsImport = GetWorksheetIfExists( _
+        ThisWorkbook, IMPORT_SHEET_NAME)
+
+    Set wsResult = GetWorksheetIfExists( _
+        ThisWorkbook, RESULT_SHEET_NAME)
+
+    '既存シートを無条件で消去せず、利用者に確認する
+    If Not ConfirmOutputSheetReset(wsImport, wsResult) Then
+        GoTo Cleanup
+    End If
+
+    '存在しない場合だけ、新しいワークシートを作る
+    Set wsImport = GetOrCreateWorksheet( _
+        ThisWorkbook, IMPORT_SHEET_NAME)
+
+    Set wsResult = GetOrCreateWorksheet( _
+        ThisWorkbook, RESULT_SHEET_NAME)
+
+    ' 6. 取込結果と組合せ計算結果をシートへ出力する
+
+    Application.StatusBar = "取込結果を出力しています..."
+    WriteImportSheet wsImport, importData, importCount
+
+    WriteResultSheet _
+        wsResult, _
+        groups, _
+        productNames
+
+    successMessage = _
+        Format$(importCount, "#,##0") & _
+        "件のCSVデータを取り込みました。" & vbCrLf & _
+        Format$(groups.Count, "#,##0") & _
+        "種類の商品コードについて計算しました。"
+
+Cleanup:
+
+    'エラーや途中終了の場合でも、Excel全体の設定を実行前へ戻す
+    On Error Resume Next
+
+    If applicationStateSaved Then
+        Application.StatusBar = previousStatusBar
+        Application.EnableEvents = previousEnableEvents
+        Application.ScreenUpdating = previousScreenUpdating
+    End If
+
+    On Error GoTo 0
+
+    '設定を戻してからメッセージを表示する
+    If Len(errorMessage) > 0 Then
+
+        MsgBox errorMessage, vbCritical
+
+    ElseIf Len(successMessage) > 0 Then
+
+        MsgBox successMessage, vbInformation
+
+    ElseIf Len(noticeMessage) > 0 Then
+
+        MsgBox noticeMessage, vbExclamation
+
+    End If
+
+    Exit Sub
+
+ErrorHandler:
+
+    'Err.Numberも表示すると、原因調査が必要なときに識別しやすい
+    errorMessage = _
+        "処理中にエラーが発生しました。" & _
+        vbCrLf & vbCrLf & _
+        "エラー番号：" & CStr(Err.Number) & vbCrLf & _
+        Err.Description
+
+    Resume Cleanup
+
+End Sub
+
+
+' CSVデータの検証とグループ化
+
+Private Sub BuildImportData( _
+    ByVal csvRows As Collection, _
+    ByVal headerRow As Long, _
+    ByVal productCol As Long, _
+    ByVal codeCol As Long, _
+    ByVal quantityCol As Long, _
+    ByRef importData() As Variant, _
+    ByRef importCount As Long, _
+    ByVal groups As Object, _
+    ByVal productNames As Object)
+
+    Dim csvRow As Collection
+    Dim orderValues As Collection
+
+    Dim fullProductCode As String
+    Dim extractedCode As String
+    Dim productName As String
+    Dim quantityText As String
+    Dim quantityValue As Double
+    Dim invalidReason As String
+
+    Dim maxImportRows As Long
+    Dim rowIndex As Long
+
+    maxImportRows = csvRows.Count - headerRow
+    ReDim importData(1 To maxImportRows, 1 To 3)
+
+    For rowIndex = headerRow + 1 To csvRows.Count
+
+        Set csvRow = csvRows(rowIndex)
+
+        productName = Trim$( _
+            GetCsvValue(csvRow, productCol))
+
+        fullProductCode = Trim$( _
+            GetCsvValue(csvRow, codeCol))
+
+        quantityText = Trim$( _
+            GetCsvValue(csvRow, quantityCol))
+
+        '3項目すべてが空欄の行だけを読み飛ばす
+        If productName <> "" _
+            Or fullProductCode <> "" _
+            Or quantityText <> "" Then
+
+            '抽出位置まで文字が存在するかを先に確認する
+            If Len(fullProductCode) < _
+                CODE_START_POSITION + CODE_CHARACTER_COUNT - 1 Then
+
+                Err.Raise _
+                    vbObjectError + 1001, _
+                    "BuildImportData", _
+                    "CSVの" & rowIndex & _
+                    "行目にある商品識別コードが短すぎます。" & _
+                    vbCrLf & _
+                    "商品識別コード：" & fullProductCode
+
+            End If
+
+            '設定された位置から商品コードを取り出す
+            extractedCode = Trim$(Mid$( _
+                fullProductCode, _
+                CODE_START_POSITION, _
+                CODE_CHARACTER_COUNT))
+
+            '空白だけで構成されたコードを受け入れない
+            If Len(extractedCode) = 0 Then
+
+                Err.Raise _
+                    vbObjectError + 1002, _
+                    "BuildImportData", _
+                    "CSVの" & rowIndex & _
+                    "行目から抽出した商品コードが空欄です。" & _
+                    vbCrLf & _
+                    "商品識別コード：" & fullProductCode
+
+            End If
+
+            '受注数を、正の整数かつ安全に計算できる範囲へ制限する
+            If Not TryParsePositiveInteger( _
+                quantityText, quantityValue, invalidReason) Then
+
+                Err.Raise _
+                    vbObjectError + 1003, _
+                    "BuildImportData", _
+                    "CSVの" & rowIndex & _
+                    "行目の受注数が正しくありません。" & _
+                    vbCrLf & _
+                    "入力値：" & quantityText & vbCrLf & _
+                    "理由：" & invalidReason
+
+            End If
+
+            importCount = importCount + 1
+
+            'Excel数式として解釈され得る先頭文字を無害化してから出力する
+            importData(importCount, 1) = MakeSafeExcelText(extractedCode)
+            importData(importCount, 2) = MakeSafeExcelText(productName)
+            importData(importCount, 3) = quantityValue
+
+            '同じ抽出コードに属する受注数をCollectionへまとめる
+            If Not groups.Exists(extractedCode) Then
+
+                Set orderValues = New Collection
+                groups.Add extractedCode, orderValues
+
+                '商品名は最初に見つかった値を代表名として保持する
+                productNames.Add extractedCode, productName
+
+            Else
+
+                Set orderValues = groups(extractedCode)
+
+                '最初の商品名が空欄だった場合だけ、後の空欄でない名称を採用する
+                If Len(CStr(productNames(extractedCode))) = 0 _
+                    And Len(productName) > 0 Then
+
+                    productNames(extractedCode) = productName
+
+                End If
+
+            End If
+
+            '同じ数量が複数行にあっても、各行を別々の1個として追加する
+            orderValues.Add quantityValue
+
+        End If
+
+    Next rowIndex
+
+End Sub
+
+
+' 受注数の文字列を検証してDouble型へ変換する
+'
+' 戻り値：
+'   True  = 正常。parsedValueへ変換結果を返す
+'   False = 不正。invalidReasonへ理由を返す
+
+Private Function TryParsePositiveInteger( _
+    ByVal sourceText As String, _
+    ByRef parsedValue As Double, _
+    ByRef invalidReason As String) As Boolean
+
+    On Error GoTo ConversionError
+
+    If Len(sourceText) = 0 Then
+        invalidReason = "空欄です。"
+        Exit Function
+    End If
+
+    If Not IsNumeric(sourceText) Then
+        invalidReason = "数値として認識できません。"
+        Exit Function
+    End If
+
+    parsedValue = CDbl(sourceText)
+
+    If parsedValue <= 0 Then
+        invalidReason = "0より大きい値を指定してください。"
+        Exit Function
+    End If
+
+    If parsedValue <> Fix(parsedValue) Then
+        invalidReason = "小数は指定できません。"
+        Exit Function
+    End If
+
+    If parsedValue > MAX_EXACT_INTEGER Then
+
+        invalidReason = _
+            "値が大きすぎます。上限は" & _
+            Format$(MAX_EXACT_INTEGER, "#,##0") & "です。"
+
+        Exit Function
+
+    End If
+
+    TryParsePositiveInteger = True
+    Exit Function
+
+ConversionError:
+
+    invalidReason = "数値への変換中にエラーが発生しました。"
+
+End Function
+
+
+' 「出力」シートへCSVの取込結果を書き込む
+
+Private Sub WriteImportSheet( _
+    ByVal targetSheet As Worksheet, _
+    ByRef importData() As Variant, _
+    ByVal importCount As Long)
+
+    Dim lastRow As Long
+
+    lastRow = importCount + 1
+
+    With targetSheet
+
+        '専用の出力シートとして再作成するため、既存セルを初期化する
+        If .AutoFilterMode Then
+            .AutoFilterMode = False
+        End If
+
+        .Cells.Clear
+
+        '見出し
+        .Range("A1").Value2 = "商品識別コード"
+        .Range("B1").Value2 = "表示品名"
+        .Range("C1").Value2 = "受注数"
+
+        'コードと商品名は、数式や数値ではなく文字列として扱う
+        .Range("A2:B" & lastRow).NumberFormat = "@"
+
+        '配列をまとめて代入し、セルを1個ずつ操作するより高速に出力する
+        .Range("A2").Resize( _
+            importCount, 3).Value2 = importData
+
+        '受注数の表示形式
+        .Range("C2:C" & lastRow).NumberFormat = "#,##0"
+
+        '見出しの書式
+        .Range("A1:C1").Font.Bold = True
+        .Range("A1:C1").Interior.Color = RGB(217, 225, 242)
+
+        '表全体の罫線とフィルター
+        .Range("A1:C" & lastRow).Borders.LineStyle = xlContinuous
+        .Range("A1:C" & lastRow).AutoFilter
+
+        .Columns("A:C").AutoFit
+
+    End With
+
+End Sub
+
+
+
+' 商品コードごとの組合せ計算を行い、「計算結果」シートへ書き込む
+
+Private Sub WriteResultSheet( _
+    ByVal targetSheet As Worksheet, _
+    ByVal groups As Object, _
+    ByVal productNames As Object)
+
+    Dim codeKeys As Variant
+    Dim currentCode As String
+    Dim orderValues As Collection
+
+    Dim reachable As Object
+    Dim previousSum As Object
+    Dim usedItem As Object
+
+    Dim possibleSums() As Double
+    Dim resultData() As Variant
+
+    Dim outputRow As Long
+    Dim dataCount As Long
+
+    Dim codeIndex As Long
+    Dim codeNumber As Long
+    Dim batchStart As Long
+    Dim batchCount As Long
+    Dim batchOffset As Long
+    Dim sumIndex As Long
+    Dim firstDataOffset As Long
+
+    With targetSheet
+
+        If .AutoFilterMode Then
+            .AutoFilterMode = False
+        End If
+
+        .Cells.Clear
+
+    End With
+
+    codeKeys = groups.Keys
+
+    '商品識別コードを文字列の昇順に並べ替える
+    If groups.Count > 1 Then
+        QuickSortText codeKeys, LBound(codeKeys), UBound(codeKeys)
+    End If
+
+    outputRow = 1
+
+    For codeIndex = LBound(codeKeys) To UBound(codeKeys)
+
+        codeNumber = codeIndex - LBound(codeKeys) + 1
+        currentCode = CStr(codeKeys(codeIndex))
+        Set orderValues = groups(currentCode)
+
+        Application.StatusBar = _
+            "組合せを計算しています：" & currentCode & _
+            "（" & Format$(codeNumber, "#,##0") & _
+            " / " & Format$(groups.Count, "#,##0") & "）"
+
+        'reachable：
+        '   作成可能な合計値をキーとして保持する
+        '
+        'previousSum：
+        '   その合計値を作る直前の合計値を保持する
+        '
+        'usedItem：
+        '   その合計値を作る最後の受注数の位置を保持する
+        Set reachable = CreateObject("Scripting.Dictionary")
+        Set previousSum = CreateObject("Scripting.Dictionary")
+        Set usedItem = CreateObject("Scripting.Dictionary")
+
+        CalculateReachableSums _
+            orderValues, _
+            reachable, _
+            previousSum, _
+            usedItem, _
+            MAX_UNIQUE_VALUES, _
+            currentCode
+
+        possibleSums = GetPossibleSums(reachable)
+        dataCount = UBound(possibleSums) - LBound(possibleSums) + 1
+
+        '実際に使用する最終行は「見出し行 + dataCount行」
+        If outputRow > targetSheet.rows.Count - dataCount Then
+
+            Err.Raise _
+                vbObjectError + 1101, _
+                "WriteResultSheet", _
+                "計算結果がExcelの最大行数を超えます。" & _
+                vbCrLf & _
+                "商品コード：" & currentCode
+
+        End If
+
+   
+        ' 商品コード単位の見出し
+
+        With targetSheet
+
+            .Cells(outputRow, 1).Value2 = _
+                "商品コード：" & currentCode
+
+            .Cells(outputRow + 1, 1).Value2 = _
+                "表示品名：" & CStr(productNames(currentCode))
+
+            .Cells(outputRow, 2).Value2 = "作れる数字"
+            .Cells(outputRow, 3).Value2 = "組み合わせ例"
+
+        End With
+
+   
+        ' 大量データでも巨大な配列を一度に作らないよう、分割して出力する
+ 
+        For batchStart = LBound(possibleSums) _
+            To UBound(possibleSums) Step OUTPUT_BATCH_SIZE
+
+            batchCount = UBound(possibleSums) - batchStart + 1
+
+            If batchCount > OUTPUT_BATCH_SIZE Then
+                batchCount = OUTPUT_BATCH_SIZE
+            End If
+
+            ReDim resultData(1 To batchCount, 1 To 2)
+
+            For batchOffset = 1 To batchCount
+
+                sumIndex = batchStart + batchOffset - 1
+
+                resultData(batchOffset, 1) = possibleSums(sumIndex)
+
+                resultData(batchOffset, 2) = BuildCombinationText( _
+                    possibleSums(sumIndex), _
+                    previousSum, _
+                    usedItem, _
+                    orderValues, _
+                    MAX_COMBINATION_TEXT_LENGTH)
+
+            Next batchOffset
+
+            firstDataOffset = _
+                batchStart - LBound(possibleSums) + 1
+
+            targetSheet.Cells( _
+                outputRow + firstDataOffset, 2).Resize( _
+                batchCount, 2).Value2 = resultData
+
+            Erase resultData
+
+        Next batchStart
+
+        ' 商品コード単位の書式
+ 
+        With targetSheet
+
+            '青色の見出し行
+            .Range( _
+                .Cells(outputRow, 1), _
+                .Cells(outputRow, 3)).Font.Bold = True
+
+            .Range( _
+                .Cells(outputRow, 1), _
+                .Cells(outputRow, 3)).Interior.Color = _
+                RGB(68, 114, 196)
+
+            .Range( _
+                .Cells(outputRow, 1), _
+                .Cells(outputRow, 3)).Font.Color = _
+                RGB(255, 255, 255)
+
+            '商品名のセル
+            .Cells(outputRow + 1, 1).Font.Bold = True
+            .Cells(outputRow + 1, 1).Interior.Color = _
+                RGB(217, 225, 242)
+
+            '表全体の罫線
+            .Range( _
+                .Cells(outputRow, 1), _
+                .Cells(outputRow + dataCount, 3)).Borders.LineStyle = _
+                xlContinuous
+
+            '合計値の表示形式
+            .Range( _
+                .Cells(outputRow + 1, 2), _
+                .Cells(outputRow + dataCount, 2)).NumberFormat = _
+                "#,##0"
+
+        End With
+
+        '次の商品コードとの間に空白行を1行入れる
+        outputRow = outputRow + dataCount + 2
+
+        '大きいDictionaryを次のループ前に解放しやすくする
+        Set reachable = Nothing
+        Set previousSum = Nothing
+        Set usedItem = Nothing
+        Erase possibleSums
+
+    Next codeIndex
+
+    'シート全体の表示調整
+    With targetSheet
+
+        .Columns("A").ColumnWidth = 35
+        .Columns("B").ColumnWidth = 15
+        .Columns("C").ColumnWidth = 55
+
+        .Columns("A:C").VerticalAlignment = xlTop
+        .Columns("C").WrapText = True
+
+        '非表示シートを無理に表示状態へ変更しない
+        If .Visible = xlSheetVisible Then
+            .Activate
+        End If
+
+    End With
+
+End Sub
+
+
+
+' 商品コードごとに作成可能な合計値を計算する
+'
+' 例：受注数が 10、20、30 の場合
+'   0、10、20、30、40、50、60 がreachableへ登録される
+'
+' 同じ受注数が複数行ある場合は、各行を別の項目として1回ずつ使用できる。
+' 追加前のreachable.Keysを複製してから処理することにより、
+' 1つの受注数を同じ計算段階で複数回使うことを防いでいる。
+
+Private Sub CalculateReachableSums( _
+    ByVal orderValues As Collection, _
+    ByVal reachable As Object, _
+    ByVal previousSum As Object, _
+    ByVal usedItem As Object, _
+    ByVal maxUniqueValues As Long, _
+    ByVal productCode As String)
+
+    Dim keyArray As Variant
+    Dim previousValue As Double
+    Dim itemValue As Double
+    Dim newValue As Double
+
+    Dim itemIndex As Long
+    Dim keyIndex As Long
+
+    '何も選択していない初期状態
+    reachable.Add 0#, True
+
+    For itemIndex = 1 To orderValues.Count
+
+        itemValue = CDbl(orderValues(itemIndex))
+
+        '現在存在する合計値だけを配列へ複製する
+        keyArray = reachable.Keys
+
+        For keyIndex = LBound(keyArray) To UBound(keyArray)
+
+            previousValue = CDbl(keyArray(keyIndex))
+
+            'Double型の整数精度を超える合計を作らない
+            If previousValue > MAX_EXACT_INTEGER - itemValue Then
+
+                Err.Raise _
+                    vbObjectError + 1201, _
+                    "CalculateReachableSums", _
+                    "商品コード「" & productCode & _
+                    "」の合計値が、安全に計算できる上限を超えます。" & _
+                    vbCrLf & _
+                    "上限：" & Format$(MAX_EXACT_INTEGER, "#,##0")
+
+            End If
+
+            newValue = previousValue + itemValue
+
+            '同じ合計値は1件だけ保持する
+            If Not reachable.Exists(newValue) Then
+
+                '合計0を除いた件数が上限へ達した場合は、追加前に停止する
+                If reachable.Count - 1 >= maxUniqueValues Then
+
+                    Err.Raise _
+                        vbObjectError + 1202, _
+                        "CalculateReachableSums", _
+                        "商品コード「" & productCode & _
+                        "」の作成可能な数字が、上限の" & _
+                        Format$(maxUniqueValues, "#,##0") & _
+                        "件を超えました。" & vbCrLf & _
+                        "対象となる受注数を減らすか、" & _
+                        "MAX_UNIQUE_VALUESを見直してください。"
+
+                End If
+
+                reachable.Add newValue, True
+
+                '組合せを後から復元するための経路を保存する
+                previousSum.Add newValue, previousValue
+                usedItem.Add newValue, itemIndex
+
+            End If
+
+        Next keyIndex
+
+    Next itemIndex
+
+End Sub
+
+
+' 作成可能な合計値を降順のDouble型配列として返す
+
+Private Function GetPossibleSums( _
+    ByVal reachable As Object) As Double()
+
+    Dim result() As Double
+    Dim keyArray As Variant
+
+    Dim resultCount As Long
+    Dim keyIndex As Long
+
+    '受注数は正の整数なので、正常なら0以外の合計が少なくとも1件存在する
+    If reachable.Count <= 1 Then
+
+        Err.Raise _
+            vbObjectError + 1301, _
+            "GetPossibleSums", _
+            "作成可能な合計値がありません。"
+
+    End If
+
+    keyArray = reachable.Keys
+    ReDim result(1 To reachable.Count - 1)
+
+    '初期値の0は結果から除外する
+    For keyIndex = LBound(keyArray) To UBound(keyArray)
+
+        If CDbl(keyArray(keyIndex)) > 0 Then
+
+            resultCount = resultCount + 1
+            result(resultCount) = CDbl(keyArray(keyIndex))
+
+        End If
+
+    Next keyIndex
+
+    If resultCount = 0 Then
+
+        Err.Raise _
+            vbObjectError + 1302, _
+            "GetPossibleSums", _
+            "0より大きい合計値がありません。"
+
+    End If
+
+    '将来ロジックを変更して件数がずれた場合にも対応できるよう、実件数へ縮める
+    If resultCount < UBound(result) Then
+        ReDim Preserve result(1 To resultCount)
+    End If
+
+    '大きい値から確認できるよう、降順へ並べ替える
+    If resultCount > 1 Then
+        QuickSortDouble result, 1, resultCount
+    End If
+
+    GetPossibleSums = result
+
+End Function
+
+
+' 指定された合計値を作る組合せ例を復元する
+'
+' 文字列が長くなりすぎる場合は、末尾側の項目だけを残して前半を省略する。
+' これにより、Excelのセル文字数上限や大量の文字列作成による停止を防ぐ。
+
+Private Function BuildCombinationText( _
+    ByVal sumValue As Double, _
+    ByVal previousSum As Object, _
+    ByVal usedItem As Object, _
+    ByVal orderValues As Collection, _
+    ByVal maxTextLength As Long) As String
+
+    Dim currentValue As Double
+    Dim itemIndex As Long
+    Dim stepCount As Long
+
+    Dim part As String
+    Dim result As String
+    Dim candidate As String
+    Dim omittedPrefix As String
+    Dim contentLimit As Long
+
+    omittedPrefix = "…（前半を省略） + "
+    contentLimit = maxTextLength - Len(omittedPrefix)
+
+    If contentLimit < 1 Then
+        contentLimit = 1
+    End If
+
+    currentValue = sumValue
+
+    Do While currentValue > 0
+
+        stepCount = stepCount + 1
+
+        '経路が循環している場合の無限ループを防ぐ
+        If stepCount > orderValues.Count Then
+
+            BuildCombinationText = _
+                "組み合わせの復元経路が不正です"
+
+            Exit Function
+
+        End If
+
+        If Not usedItem.Exists(currentValue) _
+            Or Not previousSum.Exists(currentValue) Then
+
+            BuildCombinationText = _
+                "組み合わせを復元できません"
+
+            Exit Function
+
+        End If
+
+        itemIndex = CLng(usedItem(currentValue))
+
+        If itemIndex < 1 Or itemIndex > orderValues.Count Then
+
+            BuildCombinationText = _
+                "組み合わせの項目番号が不正です"
+
+            Exit Function
+
+        End If
+
+        part = Format$( _
+            CDbl(orderValues(itemIndex)), "#,##0")
+
+        '経路は合計値から0へ逆向きにたどるため、文字列の先頭へ追加する
+        If Len(result) = 0 Then
+            candidate = part
+        Else
+            candidate = part & " + " & result
+        End If
+
+        '上限を超える直前で打ち切り、省略したことを明示する
+        If Len(candidate) > contentLimit Then
+
+            If Len(result) = 0 Then
+                result = Left$(part, contentLimit)
+            End If
+
+            BuildCombinationText = omittedPrefix & result
+            Exit Function
+
+        End If
+
+        result = candidate
+        currentValue = CDbl(previousSum(currentValue))
+
+    Loop
+
+    BuildCombinationText = result
+
+End Function
+
+
+' CSVファイルを文字列として読み込む
+'
+' ・UTF-8のBOM（EF BB BF）がある場合：UTF-8
+' ・それ以外：DEFAULT_CSV_CHARSET（初期値はShift-JIS）
+'
+' ADODB.Streamは遅延バインディングで使用するため、
+' VBEの「参照設定」を追加する必要はない。
+Private Function ReadCsvText( _
+    ByVal filePath As String) As String
+
+    Const adTypeBinary As Long = 1
+    Const adTypeText As Long = 2
+    Const adReadAll As Long = -1
+
+    Dim stream As Object
+    Dim firstBytes As Variant
+    Dim charsetName As String
+    Dim loadedText As String
+
+    Dim savedErrorNumber As Long
+    Dim savedErrorDescription As String
+
+    On Error GoTo ErrorHandler
+
+    Set stream = CreateObject("ADODB.Stream")
+
+    '最初はバイナリとして開き、先頭3バイトでUTF-8 BOMを判定する
+    With stream
+
+        .Type = adTypeBinary
+        .Open
+        .LoadFromFile filePath
+
+        charsetName = DEFAULT_CSV_CHARSET
+
+        If .Size >= 3 Then
+
+            firstBytes = .Read(3)
+
+            If firstBytes(0) = &HEF _
+                And firstBytes(1) = &HBB _
+                And firstBytes(2) = &HBF Then
+
+                charsetName = "utf-8"
+
+            End If
+
+        End If
+
+        'テキストモードへ変更するときは位置を先頭へ戻す必要がある
+        .Position = 0
+        .Type = adTypeText
+        .Charset = charsetName
+
+        loadedText = .ReadText(adReadAll)
+
+    End With
+
+    'UTF-8 BOMが文字として残った場合に備えて除去する
+    If Len(loadedText) > 0 Then
+
+        If Left$(loadedText, 1) = ChrW(&HFEFF) Then
+            loadedText = Mid$(loadedText, 2)
+        End If
+
+    End If
+
+    ReadCsvText = loadedText
+
+Cleanup:
+
+    On Error Resume Next
+
+    If Not stream Is Nothing Then
+
+        If stream.State <> 0 Then
+            stream.Close
+        End If
+
+    End If
+
+    Set stream = Nothing
+    On Error GoTo 0
+
+    If savedErrorNumber <> 0 Then
+
+        Err.Raise _
+            savedErrorNumber, _
+            "ReadCsvText", _
+            savedErrorDescription
+
+    End If
+
+    Exit Function
+
+ErrorHandler:
+
+    savedErrorNumber = Err.Number
+    savedErrorDescription = Err.Description
+    Resume Cleanup
+
+End Function
+
+
+' コンマ区切りのCSVを解析する
+'
+' 対応内容：
+'   ・ダブルクォーテーションで囲まれた項目
+'   ・項目内のコンマ
+'   ・項目内の改行
+'   ・二重のダブルクォーテーション
+'   ・CRLF、CR、LF形式の改行
+'
+' 戻り値：
+'   行を表すCollectionの中に、列を表すCollectionを格納する
+
+Private Function ParseCsv( _
+    ByVal sourceText As String) As Collection
+
+    Dim rows As New Collection
+    Dim currentRow As New Collection
+
+    Dim fieldValue As String
+    Dim currentChar As String
+    Dim nextChar As String
+
+    Dim inQuotes As Boolean
+    Dim charIndex As Long
+    Dim textLength As Long
+
+    textLength = Len(sourceText)
+    charIndex = 1
+
+    Do While charIndex <= textLength
+
+        currentChar = Mid$(sourceText, charIndex, 1)
+
+        If currentChar = """" Then
+
+            If inQuotes Then
+
+                If charIndex < textLength Then
+                    nextChar = Mid$(sourceText, charIndex + 1, 1)
+                Else
+                    nextChar = ""
+                End If
+
+                '引用符の内側で "" が現れた場合は、1個の " として扱う
+                If nextChar = """" Then
+
+                    fieldValue = fieldValue & """"
+                    charIndex = charIndex + 1
+
+                Else
+
+                    '1個の引用符なら、引用符で囲まれた項目の終了
+                    inQuotes = False
+
+                End If
+
+            ElseIf Len(fieldValue) = 0 Then
+
+                '項目の先頭にある引用符だけを開始記号として扱う
+                inQuotes = True
+
+            Else
+
+                '引用符で囲まれていない項目の途中にある " は通常文字として残す
+                fieldValue = fieldValue & """"
+
+            End If
+
+        ElseIf currentChar = "," And Not inQuotes Then
+
+            '項目の区切り
+            currentRow.Add fieldValue
+            fieldValue = ""
+
+        ElseIf _
+            (currentChar = vbCr Or currentChar = vbLf) _
+            And Not inQuotes Then
+
+            '行の区切り
+            currentRow.Add fieldValue
+            fieldValue = ""
+
+            rows.Add currentRow
+            Set currentRow = New Collection
+
+            'CRLFは2文字で1改行なので、CRの後のLFを読み飛ばす
+            If currentChar = vbCr And charIndex < textLength Then
+
+                If Mid$(sourceText, charIndex + 1, 1) = vbLf Then
+                    charIndex = charIndex + 1
+                End If
+
+            End If
+
+        Else
+
+            '引用符の内側にあるコンマや改行は、ここで通常文字として追加される
+            fieldValue = fieldValue & currentChar
+
+        End If
+
+        charIndex = charIndex + 1
+
+    Loop
+
+    '引用符が閉じていないCSVを黙って受け入れない
+    If inQuotes Then
+
+        Err.Raise _
+            vbObjectError + 1401, _
+            "ParseCsv", _
+            "CSV内に閉じられていないダブルクォーテーションがあります。"
+
+    End If
+
+    '改行で終わっていない最後の行を追加する
+    '末尾がコンマの場合もcurrentRow.Count > 0なので、最後の空項目を保持できる
+    If fieldValue <> "" Or currentRow.Count > 0 Then
+
+        currentRow.Add fieldValue
+        rows.Add currentRow
+
+    End If
+
+    Set ParseCsv = rows
+
+End Function
+
+
+
+' 必要な3列が存在する見出し行を探す
+
+Private Function FindHeaderRow( _
+    ByVal csvRows As Collection, _
+    ByRef productCol As Long, _
+    ByRef codeCol As Long, _
+    ByRef quantityCol As Long) As Long
+
+    Dim csvRow As Collection
+    Dim searchRows As Long
+
+    Dim rowIndex As Long
+    Dim columnIndex As Long
+
+    Dim productHeaderCount As Long
+    Dim codeHeaderCount As Long
+    Dim quantityHeaderCount As Long
+    Dim headerText As String
+
+    searchRows = csvRows.Count
+
+    If searchRows > HEADER_SEARCH_LIMIT Then
+        searchRows = HEADER_SEARCH_LIMIT
+    End If
+
+    For rowIndex = 1 To searchRows
+
+        Set csvRow = csvRows(rowIndex)
+
+        productCol = 0
+        codeCol = 0
+        quantityCol = 0
+
+        productHeaderCount = 0
+        codeHeaderCount = 0
+        quantityHeaderCount = 0
+
+        For columnIndex = 1 To csvRow.Count
+
+            headerText = NormalizeHeader( _
+                CStr(csvRow(columnIndex)))
+
+            Select Case headerText
+
+                Case "表示品名"
+
+                    productHeaderCount = productHeaderCount + 1
+
+                    If productCol = 0 Then
+                        productCol = columnIndex
+                    End If
+
+                Case "商品識別コード"
+
+                    codeHeaderCount = codeHeaderCount + 1
+
+                    If codeCol = 0 Then
+                        codeCol = columnIndex
+                    End If
+
+                Case "受注数"
+
+                    quantityHeaderCount = quantityHeaderCount + 1
+
+                    If quantityCol = 0 Then
+                        quantityCol = columnIndex
+                    End If
+
+            End Select
+
+        Next columnIndex
+
+        '3列がそろった行を見出し行として採用する
+        If productCol > 0 _
+            And codeCol > 0 _
+            And quantityCol > 0 Then
+
+            '同名列が重複していると、どちらを使うべきか判断できないため停止する
+            If productHeaderCount > 1 _
+                Or codeHeaderCount > 1 _
+                Or quantityHeaderCount > 1 Then
+
+                Err.Raise _
+                    vbObjectError + 1501, _
+                    "FindHeaderRow", _
+                    "CSVの見出し行に同じ列名が複数あります。" & _
+                    vbCrLf & _
+                    "対象行：" & CStr(rowIndex)
+
+            End If
+
+            FindHeaderRow = rowIndex
+            Exit Function
+
+        End If
+
+    Next rowIndex
+
+    FindHeaderRow = 0
+
+End Function
+
+
+' 見出し文字列から、比較に不要な空白・改行・BOMを除去する
+
+Private Function NormalizeHeader( _
+    ByVal headerText As String) As String
+
+    'UTF-8 BOMが文字列として残っていた場合に除去する
+    headerText = Replace$( _
+        headerText, ChrW(&HFEFF), "")
+
+    '半角・全角スペース、タブ、改行を除去する
+    headerText = Replace$(headerText, " ", "")
+    headerText = Replace$(headerText, "　", "")
+    headerText = Replace$(headerText, vbTab, "")
+    headerText = Replace$(headerText, vbCr, "")
+    headerText = Replace$(headerText, vbLf, "")
+
+    NormalizeHeader = Trim$(headerText)
+
+End Function
+
+
+' CSVの指定列から値を安全に取得する
+'
+' 行によって列数が不足している場合は、エラーではなく空文字を返す。
+' その後の項目別検証で、より分かりやすいエラー内容を表示する。
+
+Private Function GetCsvValue( _
+    ByVal csvRow As Collection, _
+    ByVal columnNumber As Long) As String
+
+    If columnNumber <= 0 Then
+
+        GetCsvValue = ""
+
+    ElseIf columnNumber > csvRow.Count Then
+
+        GetCsvValue = ""
+
+    Else
+
+        GetCsvValue = CStr(csvRow(columnNumber))
+
+    End If
+
+End Function
+
+
+
+' Excel数式として解釈され得る文字列を、通常の文字列として安全にする
+'
+' 先頭のアポストロフィは、通常はセル上に表示されない。
+' 信頼できないCSVを扱う場合の数式インジェクション対策にもなる。
+
+Private Function MakeSafeExcelText( _
+    ByVal sourceText As String) As String
+
+    Dim firstCharacter As String
+
+    If Len(sourceText) = 0 Then
+        MakeSafeExcelText = ""
+        Exit Function
+    End If
+
+    firstCharacter = Left$(sourceText, 1)
+
+    Select Case firstCharacter
+
+        Case "=", "+", "-", "@", vbTab, vbCr, vbLf
+            MakeSafeExcelText = "'" & sourceText
+
+        Case Else
+            MakeSafeExcelText = sourceText
+
+    End Select
+
+End Function
+
+
+' 既存の出力シートを初期化してよいか確認する
+'
+' どちらのシートも存在しない場合は、確認画面を出さずTrueを返す。
+' 既存シートがある場合は、誤操作を避けるため「いいえ」を既定値にする。
+
+Private Function ConfirmOutputSheetReset( _
+    ByVal wsImport As Worksheet, _
+    ByVal wsResult As Worksheet) As Boolean
+
+    Dim existingSheetNames As String
+    Dim answer As VbMsgBoxResult
+
+    If Not wsImport Is Nothing Then
+        existingSheetNames = "・" & wsImport.Name
+    End If
+
+    If Not wsResult Is Nothing Then
+
+        If Len(existingSheetNames) > 0 Then
+            existingSheetNames = existingSheetNames & vbCrLf
+        End If
+
+        existingSheetNames = _
+            existingSheetNames & "・" & wsResult.Name
+
+    End If
+
+    '対象シートがまだなければ、初期化の確認は不要
+    If Len(existingSheetNames) = 0 Then
+        ConfirmOutputSheetReset = True
+        Exit Function
+    End If
+
+    answer = MsgBox( _
+        "次の既存シートを初期化して、新しい結果を出力します。" & _
+        vbCrLf & vbCrLf & _
+        existingSheetNames & _
+        vbCrLf & vbCrLf & _
+        "セルの内容・数式・書式は消去され、" & _
+        "VBAの処理は元に戻すことができません。" & _
+        vbCrLf & _
+        "続行しますか？", _
+        vbYesNo + vbExclamation + vbDefaultButton2, _
+        "既存シートの初期化確認")
+
+    ConfirmOutputSheetReset = (answer = vbYes)
+
+End Function
+
+
+' 指定名のワークシートを取得する
+' 存在しない場合はNothingを返す
+
+Private Function GetWorksheetIfExists( _
+    ByVal targetBook As Workbook, _
+    ByVal sheetName As String) As Worksheet
+
+    On Error Resume Next
+
+    Set GetWorksheetIfExists = _
+        targetBook.Worksheets(sheetName)
+
+    On Error GoTo 0
+
+End Function
+
+
+
+' 指定名のワークシートを取得し、存在しなければ作成する
+'
+' 同名のグラフシート等が存在する場合は、名前の衝突を明示して停止する。
+
+Private Function GetOrCreateWorksheet( _
+    ByVal targetBook As Workbook, _
+    ByVal sheetName As String) As Worksheet
+
+    Dim existingSheet As Object
+    Dim newWorksheet As Worksheet
+
+    On Error Resume Next
+
+    Set existingSheet = _
+        targetBook.Sheets(sheetName)
+
+    On Error GoTo 0
+
+    If Not existingSheet Is Nothing Then
+
+        If TypeName(existingSheet) <> "Worksheet" Then
+
+            Err.Raise _
+                vbObjectError + 1601, _
+                "GetOrCreateWorksheet", _
+                "「" & sheetName & _
+                "」という名前のシートは存在しますが、" & _
+                "ワークシートではありません。"
+
+        End If
+
+        Set GetOrCreateWorksheet = existingSheet
+        Exit Function
+
+    End If
+
+    'ブックの末尾へ新しいワークシートを追加する
+    If targetBook.Sheets.Count > 0 Then
+
+        Set newWorksheet = _
+            targetBook.Worksheets.Add( _
+                After:=targetBook.Sheets(targetBook.Sheets.Count))
+
+    Else
+
+        Set newWorksheet = _
+            targetBook.Worksheets.Add
+
+    End If
+
+    newWorksheet.Name = sheetName
+    Set GetOrCreateWorksheet = newWorksheet
+
+End Function
+
+
+' Double型配列を降順へ並べ替える
+
+Private Sub QuickSortDouble( _
+    ByRef values() As Double, _
+    ByVal firstIndex As Long, _
+    ByVal lastIndex As Long)
+
+    Dim leftIndex As Long
+    Dim rightIndex As Long
+
+    Dim centerValue As Double
+    Dim temporaryValue As Double
+
+    leftIndex = firstIndex
+    rightIndex = lastIndex
+
+    centerValue = values( _
+        (firstIndex + lastIndex) \ 2)
+
+    Do While leftIndex <= rightIndex
+
+        '降順なので、基準値より大きい値は左側へ置く
+        Do While values(leftIndex) > centerValue
+            leftIndex = leftIndex + 1
+        Loop
+
+        Do While values(rightIndex) < centerValue
+            rightIndex = rightIndex - 1
+        Loop
+
+        If leftIndex <= rightIndex Then
+
+            temporaryValue = values(leftIndex)
+            values(leftIndex) = values(rightIndex)
+            values(rightIndex) = temporaryValue
+
+            leftIndex = leftIndex + 1
+            rightIndex = rightIndex - 1
+
+        End If
+
+    Loop
+
+    If firstIndex < rightIndex Then
+        QuickSortDouble values, firstIndex, rightIndex
+    End If
+
+    If leftIndex < lastIndex Then
+        QuickSortDouble values, leftIndex, lastIndex
+    End If
+
+End Sub
+
+
+' 商品識別コードの配列を文字列の昇順へ並べ替える
+
+Private Sub QuickSortText( _
+    ByRef values As Variant, _
+    ByVal firstIndex As Long, _
+    ByVal lastIndex As Long)
+
+    Dim leftIndex As Long
+    Dim rightIndex As Long
+
+    Dim centerValue As String
+    Dim temporaryValue As Variant
+
+    leftIndex = firstIndex
+    rightIndex = lastIndex
+
+    centerValue = CStr(values( _
+        (firstIndex + lastIndex) \ 2))
+
+    Do While leftIndex <= rightIndex
+
+        Do While StrComp( _
+            CStr(values(leftIndex)), _
+            centerValue, _
+            vbBinaryCompare) < 0
+
+            leftIndex = leftIndex + 1
+
+        Loop
+
+        Do While StrComp( _
+            CStr(values(rightIndex)), _
+            centerValue, _
+            vbBinaryCompare) > 0
+
+            rightIndex = rightIndex - 1
+
+        Loop
+
+        If leftIndex <= rightIndex Then
+
+            temporaryValue = values(leftIndex)
+            values(leftIndex) = values(rightIndex)
+            values(rightIndex) = temporaryValue
+
+            leftIndex = leftIndex + 1
+            rightIndex = rightIndex - 1
+
+        End If
+
+    Loop
+
+    If firstIndex < rightIndex Then
+        QuickSortText values, firstIndex, rightIndex
+    End If
+
+    If leftIndex < lastIndex Then
+        QuickSortText values, leftIndex, lastIndex
+    End If
+
+End Sub
+
+
