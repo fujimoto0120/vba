@@ -14,8 +14,11 @@ Private Const SETTINGS_SHEET_NAME As String = "設定"
 Private Const ORDER_COLUMN_NUMBER As Long = 1
 Private Const ORDER_START_ROW As Long = 2
 
-' 合計する列の名前を入力するセル
-Private Const SUM_COLUMN_NAME_CELL As String = "B2"
+' 合計する列名を入力する場所
+' B1は説明用の見出しとして使い、B2以降へ合計対象を入力します。
+' B2、B3、B4のように複数の列名を入力できます。
+Private Const SUM_COLUMN_NUMBER As Long = 2
+Private Const SUM_START_ROW As Long = 2
 
 ' 入力CSVと出力CSVの文字コード
 Private Const INPUT_CHARSET As String = "shift_jis"
@@ -52,9 +55,9 @@ Private Const MESSAGE_TITLE As String = "CSV抽出・グループ集計"
 Public Sub 必要列抽出とグループ集計()
 
     Dim outputHeaders() As String
-    Dim sumHeader As String
+    Dim sumHeaders() As String
     Dim sourceIndexes() As Long
-    Dim sumOutputIndex As Long
+    Dim isSumColumn() As Boolean
 
     Dim inputPath As String
     Dim outputPath As String
@@ -70,7 +73,7 @@ Public Sub 必要列抽出とグループ集計()
 
     On Error GoTo HandleError
 
-    ReadSettings outputHeaders, sumHeader
+    ReadSettings outputHeaders, sumHeaders
 
     ' 元CSVを選ぶダイアログは、この1回だけ表示します。
     inputPath = ChooseInputCsvPath()
@@ -87,18 +90,18 @@ Public Sub 必要列抽出とグループ集計()
     csvText = vbNullString
 
     ' 元CSVに余分な列があっても、設定した列だけを探して使います。
-    MapSourceColumns records, outputHeaders, sumHeader, _
-                     sourceIndexes, sumOutputIndex
+    MapSourceColumns records, outputHeaders, sumHeaders, _
+                     sourceIndexes, isSumColumn
 
     Application.StatusBar = "必要な列を使ってグループ集計しています..."
     AggregateRecords records, outputHeaders, sourceIndexes, _
-                     sumOutputIndex, groups, groupOrder, inputDataCount
+                     isSumColumn, groups, groupOrder, inputDataCount
 
     ' 集計が終われば元データは不要なので、出力前にメモリを解放します。
     Set records = Nothing
 
     Application.StatusBar = "集計結果を保存しています..."
-    WriteGroupedCsv outputPath, outputHeaders, sumOutputIndex, _
+    WriteGroupedCsv outputPath, outputHeaders, isSumColumn, _
                     groups, groupOrder
 
     Application.StatusBar = False
@@ -128,46 +131,87 @@ HandleError:
 End Sub
 
 
-' 設定シートから、出力列の一覧と合計対象列を読み込みます。
-' セル位置を変更するときは、コード先頭の定数だけを直せば済むようにしています。
+' 設定シートから、出力列と合計対象列の一覧を読み込みます。
 Private Sub ReadSettings( _
     ByRef outputHeaders() As String, _
-    ByRef sumHeader As String)
+    ByRef sumHeaders() As String)
 
     Dim ws As Worksheet
+    Dim outputHeaderSet As Object
+    Dim index As Long
+    Dim missingHeaders As String
+
+    Set ws = GetSettingsSheet()
+
+    ReadColumnNameList _
+        ws, ORDER_COLUMN_NUMBER, ORDER_START_ROW, _
+        "出力列", outputHeaders
+
+    ReadColumnNameList _
+        ws, SUM_COLUMN_NUMBER, SUM_START_ROW, _
+        "合計対象列", sumHeaders
+
+    Set outputHeaderSet = CreateStringSet(outputHeaders)
+
+    ' 合計対象列は、A列の出力列一覧にも含まれている必要があります。
+    For index = LBound(sumHeaders) To UBound(sumHeaders)
+        If Not outputHeaderSet.Exists(sumHeaders(index)) Then
+            If Len(missingHeaders) > 0 Then
+                missingHeaders = missingHeaders & "、"
+            End If
+            missingHeaders = missingHeaders & sumHeaders(index)
+        End If
+    Next index
+
+    If Len(missingHeaders) > 0 Then
+        RaiseUserError _
+            "次の合計対象列が、出力列の一覧にありません。" & vbCrLf & _
+            missingHeaders
+    End If
+
+End Sub
+
+
+' 設定シートの指定列から、空行のない列名一覧を読み込みます。
+' A列とB列で同じ検証方法を使うため、共通処理にしています。
+Private Sub ReadColumnNameList( _
+    ByVal ws As Worksheet, _
+    ByVal columnNumber As Long, _
+    ByVal startRow As Long, _
+    ByVal listDescription As String, _
+    ByRef names() As String)
+
     Dim lastRow As Long
     Dim rowNumber As Long
     Dim outputIndex As Long
     Dim cellValue As Variant
-    Dim headerName As String
+    Dim itemName As String
     Dim cellAddress As String
-    Dim firstListCellAddress As String
-    Dim seenHeaders As Object
+    Dim firstCellAddress As String
+    Dim seenNames As Object
 
-    Set ws = GetSettingsSheet()
-
-    firstListCellAddress = ws.Cells( _
-        ORDER_START_ROW, ORDER_COLUMN_NUMBER).Address(False, False)
+    firstCellAddress = _
+        ws.Cells(startRow, columnNumber).Address(False, False)
 
     lastRow = ws.Cells( _
-        ws.rows.Count, ORDER_COLUMN_NUMBER).End(xlUp).Row
+        ws.rows.Count, columnNumber).End(xlUp).Row
 
-    If lastRow < ORDER_START_ROW Then
+    If lastRow < startRow Then
         RaiseUserError _
-            "設定シートの" & firstListCellAddress & _
-            "以降に列名がありません。"
+            "設定シートの" & firstCellAddress & _
+            "以降に" & listDescription & "がありません。"
     End If
 
-    ReDim outputHeaders(0 To lastRow - ORDER_START_ROW)
+    ReDim names(0 To lastRow - startRow)
 
-    Set seenHeaders = CreateObject("Scripting.Dictionary")
-    seenHeaders.CompareMode = HEADER_COMPARE_MODE
+    Set seenNames = CreateObject("Scripting.Dictionary")
+    seenNames.CompareMode = HEADER_COMPARE_MODE
 
-    For rowNumber = ORDER_START_ROW To lastRow
+    For rowNumber = startRow To lastRow
 
-        cellAddress = ws.Cells( _
-            rowNumber, ORDER_COLUMN_NUMBER).Address(False, False)
-        cellValue = ws.Cells(rowNumber, ORDER_COLUMN_NUMBER).Value2
+        cellAddress = _
+            ws.Cells(rowNumber, columnNumber).Address(False, False)
+        cellValue = ws.Cells(rowNumber, columnNumber).Value2
 
         If IsError(cellValue) Then
             RaiseUserError _
@@ -175,52 +219,48 @@ Private Sub ReadSettings( _
                 "がExcelのエラー値になっています。"
         End If
 
-        headerName = NormalizeHeaderName(CStr(cellValue))
+        itemName = NormalizeHeaderName(CStr(cellValue))
 
-        ' 列名一覧の途中に空行があると設定漏れと区別できないため、エラーにします。
-        If Len(headerName) = 0 Then
+        ' 途中の空欄は入力漏れと区別できないため、エラーにします。
+        If Len(itemName) = 0 Then
             RaiseUserError _
-                "設定シートの列名一覧に空行があります。" & vbCrLf & _
+                listDescription & "の一覧に空欄があります。" & vbCrLf & _
                 "対象セル: " & cellAddress
         End If
 
-        If seenHeaders.Exists(headerName) Then
+        If seenNames.Exists(itemName) Then
             RaiseUserError _
-                "設定シートに同じ列名が複数あります。" & vbCrLf & _
-                "列名: " & headerName & vbCrLf & _
+                listDescription & "に同じ列名が複数あります。" & vbCrLf & _
+                "列名: " & itemName & vbCrLf & _
                 "対象セル: " & cellAddress
         End If
 
-        seenHeaders.Add headerName, True
-        outputHeaders(outputIndex) = headerName
+        seenNames.Add itemName, True
+        names(outputIndex) = itemName
         outputIndex = outputIndex + 1
 
     Next rowNumber
 
-    cellValue = ws.Range(SUM_COLUMN_NAME_CELL).Value2
-
-    If IsError(cellValue) Then
-        RaiseUserError _
-            "設定シートの" & SUM_COLUMN_NAME_CELL & _
-            "がExcelのエラー値になっています。"
-    End If
-
-    sumHeader = NormalizeHeaderName(CStr(cellValue))
-
-    If Len(sumHeader) = 0 Then
-        RaiseUserError _
-            "設定シートの" & SUM_COLUMN_NAME_CELL & _
-            "に、合計する列名を入力してください。"
-    End If
-
-    ' 合計列も出力列に含まれていないと、出力位置を決められません。
-    If Not seenHeaders.Exists(sumHeader) Then
-        RaiseUserError _
-            "合計対象列「" & sumHeader & _
-            "」が出力列の一覧にありません。"
-    End If
-
 End Sub
+
+
+' 文字列配列を、列名の有無をすぐ確認できるDictionaryへ変換します。
+Private Function CreateStringSet( _
+    ByRef names() As String) As Object
+
+    Dim result As Object
+    Dim index As Long
+
+    Set result = CreateObject("Scripting.Dictionary")
+    result.CompareMode = HEADER_COMPARE_MODE
+
+    For index = LBound(names) To UBound(names)
+        result.Add names(index), True
+    Next index
+
+    Set CreateStringSet = result
+
+End Function
 
 
 Private Function GetSettingsSheet() As Worksheet
@@ -531,16 +571,17 @@ End Function
 
 
 ' 元CSVの見出し名から、各必要列が何列目にあるかを調べます。
-' 設定にない列は、この対応表へ入れず、その後の集計でも使いません。
+' 合計対象かどうかも、出力列と同じ添字のBoolean配列に記録します。
 Private Sub MapSourceColumns( _
     ByVal records As Collection, _
     ByRef outputHeaders() As String, _
-    ByVal sumHeader As String, _
+    ByRef sumHeaders() As String, _
     ByRef sourceIndexes() As Long, _
-    ByRef sumOutputIndex As Long)
+    ByRef isSumColumn() As Boolean)
 
     Dim sourceHeader As Variant
     Dim sourceHeaderMap As Object
+    Dim sumHeaderSet As Object
     Dim outputIndex As Long
     Dim missingHeaders As String
 
@@ -550,11 +591,12 @@ Private Sub MapSourceColumns( _
 
     sourceHeader = records.Item(1)
     Set sourceHeaderMap = CreateSourceHeaderMap(sourceHeader)
+    Set sumHeaderSet = CreateStringSet(sumHeaders)
 
     ReDim sourceIndexes( _
         LBound(outputHeaders) To UBound(outputHeaders))
-
-    sumOutputIndex = -1
+    ReDim isSumColumn( _
+        LBound(outputHeaders) To UBound(outputHeaders))
 
     For outputIndex = LBound(outputHeaders) To UBound(outputHeaders)
 
@@ -568,13 +610,8 @@ Private Sub MapSourceColumns( _
             missingHeaders = missingHeaders & outputHeaders(outputIndex)
         End If
 
-        If StrComp( _
-            outputHeaders(outputIndex), _
-            sumHeader, _
-            vbTextCompare) = 0 Then
-
-            sumOutputIndex = outputIndex
-        End If
+        isSumColumn(outputIndex) = _
+            sumHeaderSet.Exists(outputHeaders(outputIndex))
 
     Next outputIndex
 
@@ -582,11 +619,6 @@ Private Sub MapSourceColumns( _
         RaiseUserError _
             "設定した列が元CSVに見つかりません。" & vbCrLf & _
             "該当列: " & missingHeaders
-    End If
-
-    If sumOutputIndex < 0 Then
-        RaiseUserError _
-            "合計対象列を特定できません: " & sumHeader
     End If
 
 End Sub
@@ -627,23 +659,23 @@ Private Function CreateSourceHeaderMap( _
 End Function
 
 
-' 合計列以外の必要列がすべて同じ行を、1つのグループにまとめます。
+' B列で指定していない出力列がすべて同じ行を、1つにまとめます。
+' B列で指定した列はグループ条件から外し、それぞれ個別に合計します。
 Private Sub AggregateRecords( _
     ByVal records As Collection, _
     ByRef outputHeaders() As String, _
     ByRef sourceIndexes() As Long, _
-    ByVal sumOutputIndex As Long, _
+    ByRef isSumColumn() As Boolean, _
     ByRef groups As Object, _
     ByRef groupOrder As Collection, _
     ByRef inputDataCount As Long)
 
     Dim recordNumber As Long
-    Dim rowData As Variant
-    Dim groupKey As String
-    Dim amount As Variant
-    Dim groupedRow As Variant
-    Dim newRow() As Variant
     Dim outputIndex As Long
+    Dim sourceRow As Variant
+    Dim currentRow As Variant
+    Dim groupedRow As Variant
+    Dim groupKey As String
 
     Set groups = CreateObject("Scripting.Dictionary")
     groups.CompareMode = GROUP_COMPARE_MODE
@@ -651,46 +683,44 @@ Private Sub AggregateRecords( _
 
     For recordNumber = 2 To records.Count
 
-        rowData = records.Item(recordNumber)
-        groupKey = BuildGroupKey( _
-            rowData, sourceIndexes, sumOutputIndex)
+        sourceRow = records.Item(recordNumber)
+        currentRow = BuildOutputRow( _
+            sourceRow, outputHeaders, sourceIndexes, _
+            isSumColumn, recordNumber)
 
-        amount = ParseDecimalAmount( _
-            GetCsvField(rowData, sourceIndexes(sumOutputIndex)), _
-            recordNumber, outputHeaders(sumOutputIndex))
+        groupKey = BuildGroupKey(currentRow, isSumColumn)
 
         If groups.Exists(groupKey) Then
 
             groupedRow = groups.Item(groupKey)
-            groupedRow(sumOutputIndex) = AddDecimalValues( _
-                groupedRow(sumOutputIndex), amount, recordNumber)
-            groups.Item(groupKey) = groupedRow
-
-        Else
-
-            ReDim newRow( _
-                LBound(outputHeaders) To UBound(outputHeaders))
 
             For outputIndex = _
                 LBound(outputHeaders) To UBound(outputHeaders)
 
-                newRow(outputIndex) = GetCsvField( _
-                    rowData, sourceIndexes(outputIndex))
+                If isSumColumn(outputIndex) Then
+                    groupedRow(outputIndex) = AddDecimalValues( _
+                        groupedRow(outputIndex), _
+                        currentRow(outputIndex), _
+                        recordNumber)
+                End If
             Next outputIndex
 
-            newRow(sumOutputIndex) = amount
+            groups.Item(groupKey) = groupedRow
 
-            groups.Add groupKey, newRow
+        Else
+            groups.Add groupKey, currentRow
             groupOrder.Add groupKey
         End If
 
         inputDataCount = inputDataCount + 1
 
-        If inputDataCount Mod PROGRESS_UPDATE_INTERVAL = 0 Then
-            Application.StatusBar = _
-                "グループ集計しています... " & _
-                Format$(inputDataCount, "#,##0") & "件"
-            DoEvents
+        If PROGRESS_UPDATE_INTERVAL > 0 Then
+            If inputDataCount Mod PROGRESS_UPDATE_INTERVAL = 0 Then
+                Application.StatusBar = _
+                    "グループ集計しています... " & _
+                    Format$(inputDataCount, "#,##0") & "件"
+                DoEvents
+            End If
         End If
 
     Next recordNumber
@@ -698,23 +728,56 @@ Private Sub AggregateRecords( _
 End Sub
 
 
+' 元CSVの1行から、設定した列だけを出力順に並べた配列を作ります。
+' 合計対象列は、この段階でDecimal型へ変換します。
+Private Function BuildOutputRow( _
+    ByVal sourceRow As Variant, _
+    ByRef outputHeaders() As String, _
+    ByRef sourceIndexes() As Long, _
+    ByRef isSumColumn() As Boolean, _
+    ByVal recordNumber As Long) As Variant
+
+    Dim result() As Variant
+    Dim outputIndex As Long
+    Dim fieldValue As String
+
+    ReDim result( _
+        LBound(outputHeaders) To UBound(outputHeaders))
+
+    For outputIndex = LBound(outputHeaders) To UBound(outputHeaders)
+
+        fieldValue = GetCsvField( _
+            sourceRow, sourceIndexes(outputIndex))
+
+        If isSumColumn(outputIndex) Then
+            result(outputIndex) = ParseDecimalAmount( _
+                fieldValue, recordNumber, outputHeaders(outputIndex))
+        Else
+            result(outputIndex) = fieldValue
+        End If
+
+    Next outputIndex
+
+    BuildOutputRow = result
+
+End Function
+
+
 ' 値をそのまま連結すると組み合わせが衝突することがあります。
 ' 各値の文字数もキーへ含めることで、値に記号があっても区別できます。
 Private Function BuildGroupKey( _
-    ByVal rowData As Variant, _
-    ByRef sourceIndexes() As Long, _
-    ByVal sumOutputIndex As Long) As String
+    ByVal outputRow As Variant, _
+    ByRef isSumColumn() As Boolean) As String
 
     Dim outputIndex As Long
     Dim fieldValue As String
     Dim key As String
 
     For outputIndex = _
-        LBound(sourceIndexes) To UBound(sourceIndexes)
+        LBound(outputRow) To UBound(outputRow)
 
-        If outputIndex <> sumOutputIndex Then
-            fieldValue = GetCsvField( _
-                rowData, sourceIndexes(outputIndex))
+        If Not isSumColumn(outputIndex) Then
+            fieldValue = CStr(outputRow(outputIndex))
             key = key & _
                   CStr(Len(fieldValue)) & ":" & fieldValue & "|"
         End If
@@ -841,7 +904,7 @@ End Function
 Private Sub WriteGroupedCsv( _
     ByVal outputPath As String, _
     ByRef outputHeaders() As String, _
-    ByVal sumOutputIndex As Long, _
+    ByRef isSumColumn() As Boolean, _
     ByVal groups As Object, _
     ByVal groupOrder As Collection)
 
@@ -866,7 +929,7 @@ Private Sub WriteGroupedCsv( _
         For orderIndex = 1 To groupOrder.Count
             groupedRow = groups.Item(groupOrder.Item(orderIndex))
             .WriteText _
-                BuildDataCsvLine(groupedRow, sumOutputIndex), _
+                BuildDataCsvLine(groupedRow, isSumColumn), _
                 AD_WRITE_LINE
         Next orderIndex
 
@@ -913,7 +976,7 @@ End Function
 
 Private Function BuildDataCsvLine( _
     ByVal groupedRow As Variant, _
-    ByVal sumOutputIndex As Long) As String
+    ByRef isSumColumn() As Boolean) As String
 
     Dim escapedFields() As String
     Dim index As Long
@@ -923,13 +986,15 @@ Private Function BuildDataCsvLine( _
         LBound(groupedRow) To UBound(groupedRow))
 
     For index = LBound(groupedRow) To UBound(groupedRow)
-        If index = sumOutputIndex Then
+
+        If isSumColumn(index) Then
             fieldValue = DecimalToCsvText(groupedRow(index))
         Else
             fieldValue = CStr(groupedRow(index))
         End If
 
         escapedFields(index) = EscapeCsvField(fieldValue)
+
     Next index
 
     BuildDataCsvLine = Join(escapedFields, CSV_DELIMITER)
