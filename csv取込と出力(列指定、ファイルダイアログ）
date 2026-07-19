@@ -1,0 +1,841 @@
+Option Explicit
+'csvデータを取り込んで、セルA2以降に入力された列名のみを抜き出す。その後にcsvを出力し、ファイルダイアログで保存できるshift_jisを前提にしてる。
+'【最初に確認・変更する設定】
+
+'-----------------------------------------------------------------------
+'★必要な列名を入力する場所
+'
+'   シート名 : 「設定」
+'   入力場所 : A2以降
+'   A1       : 「必要な列名」と入力（説明用。処理では使用しません）
+'
+'シート見出しの名前を変更した場合は、次の1行だけ変更してください。
+'-----------------------------------------------------------------------
+Private Const SETTINGS_SHEET_NAME As String = "設定"
+
+'必要列名を入力する列：A列=1、B列=2、C列=3……
+Private Const SETTINGS_COLUMN As Long = 1
+
+'必要列名の入力開始行
+Private Const SETTINGS_FIRST_ROW As Long = 2
+
+'-----------------------------------------------------------------------
+'★CSVの形式
+'
+'区切り文字はコンマです。入力元はShift-JISとして読み込みます。
+'-----------------------------------------------------------------------
+Private Const SOURCE_CHARSET As String = "shift_jis"
+
+'-----------------------------------------------------------------------
+'★出力CSVの文字コード
+'
+'通常は "shift_jis" のまま使用してください。
+'UTF-8へ変更するときは "utf-8" に書き換えます。
+'使用できる値："shift_jis" または "utf-8"
+'-----------------------------------------------------------------------
+Private Const OUTPUT_CHARSET As String = "shift_jis"
+
+'UTF-8出力時にBOMを付けるか
+'Excelで開く用途ならTrue、連携先からBOMなしを指定されたらFalse
+'Shift-JIS出力時には、この設定は使用されません。
+Private Const OUTPUT_UTF8_WITH_BOM As Boolean = True
+
+'-----------------------------------------------------------------------
+'★新規CSVの初期ファイル名
+'
+'保存ダイアログには、次の形式で初期表示します。
+'例：抽出結果_20260719_153045.csv
+'-----------------------------------------------------------------------
+Private Const DEFAULT_OUTPUT_FILE_PREFIX As String = "抽出結果_"
+Private Const ADD_TIMESTAMP_TO_DEFAULT_NAME As Boolean = True
+
+
+'【メイン処理】
+
+Public Sub 必要列だけCSV出力()
+
+    Const PROCEDURE_NAME As String = "必要列だけCSV出力"
+
+    Dim settingsWs As Worksheet
+    Dim csvRows As Collection
+    Dim requestedNames As Collection
+
+    Dim headerMap As Object
+    Dim fileSystem As Object
+
+    Dim sourceHeader As Variant
+    Dim selectedIndexes() As Long
+
+    Dim baseFolder As String
+    Dim sourcePath As String
+    Dim outputPath As String
+    Dim temporaryPath As String
+
+    Dim sourceText As String
+    Dim outputText As String
+    Dim headerName As String
+    Dim missingColumns As String
+
+    Dim columnIndex As Long
+    Dim i As Long
+
+    On Error GoTo ErrorHandler
+
+    'マクロブックが未保存の場合、出力フォルダを取得できないため中止
+    If Len(ThisWorkbook.Path) = 0 Then
+        Err.Raise vbObjectError + 1000, PROCEDURE_NAME, _
+                  "このExcelブックを先に保存してください。"
+    End If
+
+    'ファイル選択・保存ダイアログの初期フォルダ
+    baseFolder = ThisWorkbook.Path
+
+    '---------------------------------------------------------------------------
+    'コピー元CSVをファイル選択ダイアログで指定
+    'ダイアログはマクロブックと同じフォルダから開きますが、
+    '別のフォルダにあるCSVも選択できます。
+    '---------------------------------------------------------------------------
+    sourcePath = SelectSourceCsv(baseFolder)
+
+    'キャンセルされた場合は、エラーを表示せずに終了
+    If Len(sourcePath) = 0 Then
+        Application.StatusBar = False
+        Exit Sub
+    End If
+
+    '選択したファイルの存在確認
+    If Len(Dir$(sourcePath)) = 0 Then
+        Err.Raise vbObjectError + 1001, PROCEDURE_NAME, _
+                  "選択したコピー元CSVが見つかりません。" & vbCrLf & _
+                  sourcePath
+    End If
+
+    '---------------------------------------------------------------------------
+    '抽出結果を保存する、新しいCSVのファイル名と保存場所を指定
+    '初期表示はマクロブックと同じフォルダです。
+    '---------------------------------------------------------------------------
+    outputPath = SelectOutputCsv(baseFolder)
+
+    'キャンセルされた場合は、何も出力せず終了
+    If Len(outputPath) = 0 Then
+        Application.StatusBar = False
+        Exit Sub
+    End If
+
+    'コピー元とコピー先が同一ファイルの場合は中止
+    If StrComp(sourcePath, outputPath, vbTextCompare) = 0 Then
+        Err.Raise vbObjectError + 1002, PROCEDURE_NAME, _
+                  "コピー元CSVとコピー先CSVに同じファイルは指定できません。"
+    End If
+
+    '既存ファイルを選んだ場合だけ、明示的に上書き確認
+    If Len(Dir$(outputPath)) > 0 Then
+        If MsgBox( _
+            "次のCSVは既に存在します。" & vbCrLf & vbCrLf & _
+            outputPath & vbCrLf & vbCrLf & _
+            "上書きしますか？", _
+            vbQuestion Or vbYesNo Or vbDefaultButton2, _
+            "上書き確認") <> vbYes Then
+
+            Application.StatusBar = False
+            Exit Sub
+        End If
+    End If
+
+    '出力完了前に既存ファイルを壊さないよう、一時ファイルを使用
+    temporaryPath = outputPath & ".writing.tmp"
+
+    '文字コード設定の入力ミスを早い段階で検出
+    ValidateCharsetSetting SOURCE_CHARSET, "SOURCE_CHARSET"
+    ValidateCharsetSetting OUTPUT_CHARSET, "OUTPUT_CHARSET"
+
+    Application.StatusBar = _
+        "設定シート「" & SETTINGS_SHEET_NAME & "」を確認しています..."
+
+    'コード上部で指定した表示シート名から設定シートを取得
+    Set settingsWs = GetSettingsWorksheet()
+
+    '設定シートのA2以降から必要な列名を取得
+    Set requestedNames = LoadRequestedColumnNames(settingsWs)
+
+    Application.StatusBar = "コピー元CSVを読み込んでいます..."
+
+    'ExcelでCSVを直接開かず、Shift-JISの文字列として読み込む
+    'このため、郵便番号や社員番号などの先頭ゼロが消えません。
+    sourceText = ReadAllText(sourcePath, SOURCE_CHARSET)
+
+    'コンマ、ダブルクォート、セル内改行を考慮してCSVを解析
+    Set csvRows = ParseCsv(sourceText)
+
+    If csvRows.Count = 0 Then
+        Err.Raise vbObjectError + 1003, PROCEDURE_NAME, _
+                  "コピー元CSVにデータがありません。"
+    End If
+
+    'コピー元CSVの1行目を列名として取得
+    sourceHeader = csvRows.Item(1)
+
+    '---------------------------------------------------------------------------
+    '列名とコピー元CSV内の列位置を対応付ける
+    '大文字・小文字は区別しません。
+    '---------------------------------------------------------------------------
+    Set headerMap = CreateObject("Scripting.Dictionary")
+    headerMap.CompareMode = vbTextCompare
+
+    For columnIndex = LBound(sourceHeader) To UBound(sourceHeader)
+
+        headerName = NormalizeHeaderName(CStr(sourceHeader(columnIndex)))
+
+        '空の列名は対象外
+        If Len(headerName) > 0 Then
+
+            '同じ列名が複数あると、どちらを使うか判断できないため中止
+            If headerMap.Exists(headerName) Then
+                Err.Raise vbObjectError + 1004, PROCEDURE_NAME, _
+                          "コピー元CSVに同じ列名が複数あります。" & vbCrLf & _
+                          "列名：" & headerName
+            End If
+
+            headerMap.Add headerName, columnIndex
+
+        End If
+    Next columnIndex
+
+    '設定シートに書かれた列名を、コピー元CSVの列番号へ変換
+    '設定シートの並び順が、そのまま出力CSVの列順になります。
+    ReDim selectedIndexes(0 To requestedNames.Count - 1)
+
+    For i = 1 To requestedNames.Count
+
+        headerName = NormalizeHeaderName(CStr(requestedNames.Item(i)))
+
+        If headerMap.Exists(headerName) Then
+
+            selectedIndexes(i - 1) = CLng(headerMap.Item(headerName))
+
+        Else
+
+            If Len(missingColumns) > 0 Then
+                missingColumns = missingColumns & "、"
+            End If
+
+            missingColumns = missingColumns & CStr(requestedNames.Item(i))
+
+        End If
+    Next i
+
+    '存在しない列が1つでもあれば、コピー先を上書きせずに中止
+    If Len(missingColumns) > 0 Then
+        Err.Raise vbObjectError + 1005, PROCEDURE_NAME, _
+                  "設定された列がコピー元CSVに見つかりません。" & vbCrLf & _
+                  "該当列：" & missingColumns
+    End If
+
+    Application.StatusBar = "出力CSVを作成しています..."
+
+    '選択した列だけでCSVを作成
+    outputText = BuildSelectedCsv(csvRows, selectedIndexes)
+
+    'まず一時ファイルへ、指定した文字コードで書き込む
+    WriteAllText temporaryPath, _
+                 outputText, _
+                 OUTPUT_CHARSET, _
+                 OUTPUT_UTF8_WITH_BOM
+
+    '一時ファイルの作成に成功した後で、新しいCSVとして保存
+    Set fileSystem = CreateObject("Scripting.FileSystemObject")
+
+    fileSystem.CopyFile temporaryPath, outputPath, True
+    fileSystem.DeleteFile temporaryPath, True
+
+    Application.StatusBar = False
+
+    MsgBox _
+        "CSVの出力が完了しました。" & vbCrLf & vbCrLf & _
+        "コピー元：" & sourcePath & vbCrLf & _
+        "設定シート：" & settingsWs.Name & _
+            "（A" & SETTINGS_FIRST_ROW & "以降）" & vbCrLf & _
+        "抽出列数：" & Format$(requestedNames.Count, "#,##0") & vbCrLf & _
+        "データ行数：" & Format$(csvRows.Count - 1, "#,##0") & vbCrLf & _
+        "文字コード：" & GetOutputCharsetDescription() & vbCrLf & _
+        "出力先：" & outputPath, _
+        vbInformation, _
+        "処理完了"
+
+    Exit Sub
+
+ErrorHandler:
+
+    Dim errorMessage As String
+
+    errorMessage = Err.Description
+    Application.StatusBar = False
+
+    'エラー発生時に一時ファイルが残っていたら削除
+    On Error Resume Next
+
+    If Len(temporaryPath) > 0 Then
+        If Len(Dir$(temporaryPath)) > 0 Then
+            Kill temporaryPath
+        End If
+    End If
+
+    On Error GoTo 0
+
+    MsgBox _
+        "処理を中止しました。" & vbCrLf & vbCrLf & errorMessage, _
+        vbCritical, _
+        "CSV出力エラー"
+
+End Sub
+
+
+'【コピー元CSVの選択】
+
+Private Function SelectSourceCsv(ByVal initialFolder As String) As String
+
+    Const FILE_PICKER As Long = 3
+
+    Dim dialog As Object
+
+    Set dialog = Application.FileDialog(FILE_PICKER)
+
+    With dialog
+
+        .Title = "コピー元のCSVファイルを選択してください"
+        .AllowMultiSelect = False
+
+        .Filters.Clear
+        .Filters.Add "CSVファイル", "*.csv"
+
+        '最初はマクロブックと同じフォルダを表示
+        .InitialFileName = initialFolder & Application.PathSeparator
+
+        If .Show = -1 Then
+            SelectSourceCsv = CStr(.SelectedItems(1))
+        Else
+            SelectSourceCsv = vbNullString
+        End If
+
+    End With
+
+    Set dialog = Nothing
+
+End Function
+
+
+'【新しいCSVの保存先を選択】
+
+Private Function SelectOutputCsv(ByVal initialFolder As String) As String
+
+    Dim defaultFileName As String
+    Dim selectedPath As Variant
+    Dim resultPath As String
+
+    defaultFileName = DEFAULT_OUTPUT_FILE_PREFIX
+
+    If ADD_TIMESTAMP_TO_DEFAULT_NAME Then
+        defaultFileName = defaultFileName & _
+                          Format$(Now, "yyyymmdd_hhnnss")
+    End If
+
+    defaultFileName = defaultFileName & ".csv"
+
+    selectedPath = Application.GetSaveAsFilename( _
+        InitialFileName:=initialFolder & _
+                         Application.PathSeparator & _
+                         defaultFileName, _
+        FileFilter:="CSVファイル (*.csv),*.csv", _
+        FilterIndex:=1, _
+        Title:="新しく出力するCSVの保存先を指定してください")
+
+    'キャンセル時はBoolean型のFalseが返る
+    If VarType(selectedPath) = vbBoolean Then
+        If selectedPath = False Then
+            SelectOutputCsv = vbNullString
+            Exit Function
+        End If
+    End If
+
+    resultPath = CStr(selectedPath)
+
+    '拡張子が省略された場合は.csvを付ける
+    If LCase$(Right$(resultPath, 4)) <> ".csv" Then
+        resultPath = resultPath & ".csv"
+    End If
+
+    SelectOutputCsv = resultPath
+
+End Function
+
+
+'【設定シートの取得】
+' シート見出しの名前をコード最上部の定数で指定します。
+
+Private Function GetSettingsWorksheet() As Worksheet
+
+    On Error Resume Next
+    Set GetSettingsWorksheet = _
+        ThisWorkbook.Worksheets(SETTINGS_SHEET_NAME)
+    On Error GoTo 0
+
+    If GetSettingsWorksheet Is Nothing Then
+        Err.Raise vbObjectError + 1100, "GetSettingsWorksheet", _
+                  "設定シート「" & SETTINGS_SHEET_NAME & _
+                  "」が見つかりません。" & vbCrLf & _
+                  "実際のシート名に合わせて、コード最上部の" & vbCrLf & _
+                  "SETTINGS_SHEET_NAME を変更してください。"
+    End If
+
+End Function
+
+
+
+'【必要列名の読み込み】
+
+Private Function LoadRequestedColumnNames( _
+    ByVal settingsWs As Worksheet) As Collection
+
+    Dim result As Collection
+    Dim duplicateCheck As Object
+
+    Dim lastRow As Long
+    Dim rowNumber As Long
+    Dim columnName As String
+    Dim cellValue As Variant
+
+    Set result = New Collection
+
+    Set duplicateCheck = CreateObject("Scripting.Dictionary")
+    duplicateCheck.CompareMode = vbTextCompare
+
+    lastRow = settingsWs.Cells( _
+        settingsWs.rows.Count, SETTINGS_COLUMN).End(xlUp).Row
+
+    For rowNumber = SETTINGS_FIRST_ROW To lastRow
+
+        cellValue = settingsWs.Cells(rowNumber, SETTINGS_COLUMN).Value2
+
+        If IsError(cellValue) Then
+            Err.Raise vbObjectError + 1200, _
+                      "LoadRequestedColumnNames", _
+                      "設定シートのセルにエラー値があります。" & vbCrLf & _
+                      "セル：" & settingsWs.Cells( _
+                          rowNumber, SETTINGS_COLUMN).Address(False, False)
+        End If
+
+        columnName = Trim$(CStr(cellValue))
+
+        '途中の空白セルは無視
+        If Len(columnName) > 0 Then
+
+            '同じ列を2回指定した場合は、設定ミスとして中止
+            If duplicateCheck.Exists(columnName) Then
+                Err.Raise vbObjectError + 1201, _
+                          "LoadRequestedColumnNames", _
+                          "設定シートに同じ列名が複数回指定されています。" & _
+                          vbCrLf & "列名：" & columnName
+            End If
+
+            duplicateCheck.Add columnName, True
+            result.Add columnName
+
+        End If
+    Next rowNumber
+
+    If result.Count = 0 Then
+        Err.Raise vbObjectError + 1202, _
+                  "LoadRequestedColumnNames", _
+                  "必要な列名が設定されていません。" & vbCrLf & _
+                  "シート「" & settingsWs.Name & "」のA" & _
+                  SETTINGS_FIRST_ROW & "以降に列名を入力してください。"
+    End If
+
+    Set LoadRequestedColumnNames = result
+
+End Function
+
+
+'【CSVの解析】
+' コンマ、ダブルクォート、セル内改行を考慮してCSVを分解します。
+
+Private Function ParseCsv(ByVal csvText As String) As Collection
+
+    Dim rows As Collection
+    Dim fields As Collection
+
+    Dim rowData As Variant
+
+    Dim fieldText As String
+    Dim currentCharacter As String
+    Dim nextCharacter As String
+
+    Dim characterNumber As Long
+    Dim textLength As Long
+
+    Dim insideQuotes As Boolean
+    Dim afterClosingQuote As Boolean
+
+    Set rows = New Collection
+    Set fields = New Collection
+
+    textLength = Len(csvText)
+
+    If textLength = 0 Then
+        Set ParseCsv = rows
+        Exit Function
+    End If
+
+    characterNumber = 1
+
+    Do While characterNumber <= textLength
+
+        currentCharacter = Mid$(csvText, characterNumber, 1)
+
+        If insideQuotes Then
+
+            If currentCharacter = """" Then
+
+                'ダブルクォート2個は、値中のダブルクォート1個を表す
+                If characterNumber < textLength Then
+                    nextCharacter = Mid$( _
+                        csvText, characterNumber + 1, 1)
+                Else
+                    nextCharacter = vbNullString
+                End If
+
+                If nextCharacter = """" Then
+                    fieldText = fieldText & """"
+                    characterNumber = characterNumber + 1
+                Else
+                    insideQuotes = False
+                    afterClosingQuote = True
+                End If
+
+            Else
+                fieldText = fieldText & currentCharacter
+            End If
+
+        ElseIf afterClosingQuote Then
+
+            Select Case currentCharacter
+
+                Case ","
+                    fields.Add fieldText
+                    fieldText = vbNullString
+                    afterClosingQuote = False
+
+                Case vbCr, vbLf
+                    fields.Add fieldText
+                    rowData = CollectionToArray(fields)
+                    rows.Add rowData
+
+                    Set fields = New Collection
+                    fieldText = vbNullString
+                    afterClosingQuote = False
+
+                    'CRLFの場合、LFを読み飛ばす
+                    If currentCharacter = vbCr Then
+                        If characterNumber < textLength Then
+                            If Mid$(csvText, characterNumber + 1, 1) = vbLf Then
+                                characterNumber = characterNumber + 1
+                            End If
+                        End If
+                    End If
+
+                Case Else
+                    Err.Raise vbObjectError + 1300, "ParseCsv", _
+                              "CSVのダブルクォートの後に" & _
+                              "不正な文字があります。" & vbCrLf & _
+                              "文字位置：" & characterNumber
+            End Select
+
+        Else
+
+            Select Case currentCharacter
+
+                Case """"
+                    If Len(fieldText) = 0 Then
+                        insideQuotes = True
+                    Else
+                        Err.Raise vbObjectError + 1301, "ParseCsv", _
+                                  "CSVのダブルクォートの位置が不正です。" & _
+                                  vbCrLf & _
+                                  "文字位置：" & characterNumber
+                    End If
+
+                Case ","
+                    fields.Add fieldText
+                    fieldText = vbNullString
+
+                Case vbCr, vbLf
+                    fields.Add fieldText
+                    rowData = CollectionToArray(fields)
+                    rows.Add rowData
+
+                    Set fields = New Collection
+                    fieldText = vbNullString
+
+                    'CRLFの場合、LFを読み飛ばす
+                    If currentCharacter = vbCr Then
+                        If characterNumber < textLength Then
+                            If Mid$(csvText, characterNumber + 1, 1) = vbLf Then
+                                characterNumber = characterNumber + 1
+                            End If
+                        End If
+                    End If
+
+                Case Else
+                    fieldText = fieldText & currentCharacter
+
+            End Select
+
+        End If
+
+        characterNumber = characterNumber + 1
+
+    Loop
+
+    If insideQuotes Then
+        Err.Raise vbObjectError + 1302, "ParseCsv", _
+                  "CSV内に閉じられていないダブルクォートがあります。"
+    End If
+
+    'CSVの最終行が改行で終わっていない場合
+    If Right$(csvText, 1) <> vbCr And Right$(csvText, 1) <> vbLf Then
+
+        fields.Add fieldText
+        rowData = CollectionToArray(fields)
+        rows.Add rowData
+
+    End If
+
+    Set ParseCsv = rows
+
+End Function
+
+
+'Collectionを0始まりの文字列配列へ変換
+Private Function CollectionToArray( _
+    ByVal sourceCollection As Collection) As Variant
+
+    Dim result() As String
+    Dim i As Long
+
+    ReDim result(0 To sourceCollection.Count - 1)
+
+    For i = 1 To sourceCollection.Count
+        result(i - 1) = CStr(sourceCollection.Item(i))
+    Next i
+
+    CollectionToArray = result
+
+End Function
+
+
+'【指定列だけでCSVを作成】
+
+Private Function BuildSelectedCsv( _
+    ByVal csvRows As Collection, _
+    ByRef selectedIndexes() As Long) As String
+
+    Dim outputLines() As String
+    Dim outputFields() As String
+
+    Dim rowData As Variant
+
+    Dim rowNumber As Long
+    Dim selectedNumber As Long
+    Dim sourceIndex As Long
+    Dim selectedCount As Long
+
+    selectedCount = UBound(selectedIndexes) - _
+                    LBound(selectedIndexes) + 1
+
+    ReDim outputLines(0 To csvRows.Count - 1)
+    ReDim outputFields(0 To selectedCount - 1)
+
+    For rowNumber = 1 To csvRows.Count
+
+        rowData = csvRows.Item(rowNumber)
+
+        For selectedNumber = 0 To selectedCount - 1
+
+            sourceIndex = selectedIndexes(selectedNumber)
+
+            'その行の列数が見出し行より少ない場合は空文字を出力
+            If sourceIndex <= UBound(rowData) Then
+                outputFields(selectedNumber) = _
+                    EscapeCsvField(CStr(rowData(sourceIndex)))
+            Else
+                outputFields(selectedNumber) = vbNullString
+            End If
+
+        Next selectedNumber
+
+        outputLines(rowNumber - 1) = Join(outputFields, ",")
+
+    Next rowNumber
+
+    'Windows標準のCRLFで出力し、最終行にも改行を付ける
+    BuildSelectedCsv = Join(outputLines, vbCrLf) & vbCrLf
+
+End Function
+
+
+'CSVの値を必要に応じてダブルクォートで囲む
+Private Function EscapeCsvField(ByVal fieldValue As String) As String
+
+    Dim quotationRequired As Boolean
+
+    quotationRequired = _
+        InStr(1, fieldValue, ",", vbBinaryCompare) > 0 Or _
+        InStr(1, fieldValue, """", vbBinaryCompare) > 0 Or _
+        InStr(1, fieldValue, vbCr, vbBinaryCompare) > 0 Or _
+        InStr(1, fieldValue, vbLf, vbBinaryCompare) > 0 Or _
+        Left$(fieldValue, 1) = " " Or _
+        Right$(fieldValue, 1) = " "
+
+    If quotationRequired Then
+        EscapeCsvField = """" & _
+                         Replace(fieldValue, """", """""") & _
+                         """"
+    Else
+        EscapeCsvField = fieldValue
+    End If
+
+End Function
+
+
+'列名の前後にある余分な空白を除去
+Private Function NormalizeHeaderName(ByVal headerName As String) As String
+
+    NormalizeHeaderName = Trim$(headerName)
+
+End Function
+
+
+'【テキストファイルの読み込み】
+' ADODBは参照設定不要の遅延バインディングで使用します。
+
+Private Function ReadAllText( _
+    ByVal filePath As String, _
+    ByVal charsetName As String) As String
+
+    Const AD_TYPE_TEXT As Long = 2
+    Const AD_READ_ALL As Long = -1
+
+    Dim stream As Object
+
+    Set stream = CreateObject("ADODB.Stream")
+
+    With stream
+        .Type = AD_TYPE_TEXT
+        .Charset = charsetName
+        .Open
+        .LoadFromFile filePath
+
+        ReadAllText = .ReadText(AD_READ_ALL)
+
+        .Close
+    End With
+
+    Set stream = Nothing
+
+End Function
+
+
+'【テキストファイルの書き込み】
+
+Private Sub WriteAllText( _
+    ByVal filePath As String, _
+    ByVal outputText As String, _
+    ByVal charsetName As String, _
+    ByVal includeUtf8Bom As Boolean)
+
+    Const AD_TYPE_BINARY As Long = 1
+    Const AD_TYPE_TEXT As Long = 2
+    Const AD_SAVE_CREATE_OVERWRITE As Long = 2
+
+    Dim textStream As Object
+    Dim binaryStream As Object
+
+    Set textStream = CreateObject("ADODB.Stream")
+
+    With textStream
+        .Type = AD_TYPE_TEXT
+        .Charset = charsetName
+        .Open
+        .WriteText outputText
+
+        'UTF-8かつBOMなしを指定された場合だけ、先頭3バイトを除去
+        If StrComp(charsetName, "utf-8", vbTextCompare) = 0 _
+           And Not includeUtf8Bom Then
+
+            .position = 0
+            .Type = AD_TYPE_BINARY
+            .position = 3
+
+            Set binaryStream = CreateObject("ADODB.Stream")
+
+            With binaryStream
+                .Type = AD_TYPE_BINARY
+                .Open
+
+                textStream.CopyTo binaryStream
+                .SaveToFile filePath, AD_SAVE_CREATE_OVERWRITE
+                .Close
+            End With
+
+            Set binaryStream = Nothing
+
+        Else
+
+            'Shift-JIS、またはBOM付きUTF-8
+            .SaveToFile filePath, AD_SAVE_CREATE_OVERWRITE
+
+        End If
+
+        .Close
+    End With
+
+    Set textStream = Nothing
+
+End Sub
+
+
+'【文字コード設定の検証・表示】
+
+Private Sub ValidateCharsetSetting( _
+    ByVal charsetName As String, _
+    ByVal settingName As String)
+
+    If StrComp(charsetName, "shift_jis", vbTextCompare) <> 0 _
+       And StrComp(charsetName, "utf-8", vbTextCompare) <> 0 Then
+
+        Err.Raise vbObjectError + 1400, _
+                  "ValidateCharsetSetting", _
+                  settingName & " の指定が正しくありません。" & vbCrLf & _
+                  "「shift_jis」または「utf-8」を指定してください。"
+    End If
+
+End Sub
+
+
+Private Function GetOutputCharsetDescription() As String
+
+    If StrComp(OUTPUT_CHARSET, "utf-8", vbTextCompare) = 0 Then
+
+        If OUTPUT_UTF8_WITH_BOM Then
+            GetOutputCharsetDescription = "UTF-8（BOMあり）"
+        Else
+            GetOutputCharsetDescription = "UTF-8（BOMなし）"
+        End If
+
+    Else
+        GetOutputCharsetDescription = "Shift-JIS"
+    End If
+
+End Function
+
+
