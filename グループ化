@@ -1,0 +1,799 @@
+Option Explicit
+'A列に列順を記入。B列に合計を出したい列名を記入。シート名は"設定"にしておくこと
+'===============================================================================
+' 保守時に最初に確認する設定
+'===============================================================================
+
+' このコードを格納したブック内の設定シートを参照している。
+' PERSONAL.XLSBやアドインから実行する場合は、GetSettingsSheetのThisWorkbookを
+' ActiveWorkbookなどに変更すること。
+Private Const SETTINGS_SHEET_NAME As String = "設定"
+
+' 設定シートA列: 出力列順（A1は見出し、A2以降にCSVの列名を空行なしで記載）
+Private Const ORDER_COLUMN_NUMBER As Long = 1
+Private Const ORDER_START_ROW As Long = 2
+
+' 設定シートB2: 合計対象となる列名
+Private Const SUM_COLUMN_NAME_CELL As String = "B2"
+
+' 日本語版Windowsで一般に「Shift_JIS」と呼ばれるWindows-31J（CP932）を
+' ADODB.Stream経由で読み書きさせてる。
+Private Const INPUT_CHARSET As String = "shift_jis"
+Private Const OUTPUT_CHARSET As String = "shift_jis"
+
+Private Const CSV_DELIMITER As String = ","
+Private Const DEFAULT_OUTPUT_SUFFIX As String = "_grouped"
+
+' True : 合計列の空欄を0として扱う
+' False: 合計列の空欄をエラーにする
+Private Const BLANK_SUM_VALUE_IS_ZERO As Boolean = True
+
+' 見出し照合は大文字・小文字を区別しません。
+' グループ値は大文字・小文字、前後空白を含めて完全一致で判定します。
+Private Const HEADER_COMPARE_MODE As Long = 1     ' vbTextCompare
+Private Const GROUP_COMPARE_MODE As Long = 0      ' vbBinaryCompare
+
+' ADODB.Stream用（参照設定を不要にするため数値で定義）
+Private Const AD_TYPE_TEXT As Long = 2
+Private Const AD_WRITE_LINE As Long = 1
+Private Const AD_SAVE_CREATE_OVERWRITE As Long = 2
+Private Const AD_CRLF As Long = -1
+
+' メイン処理
+
+Public Sub GroupShiftJisCsvAndSave()
+    Dim outputHeaders() As String
+    Dim sumHeader As String
+    Dim inputPath As String
+    Dim outputPath As String
+    Dim csvText As String
+    Dim records As Collection
+    Dim sourceIndexes() As Long
+    Dim targetOutputIndex As Long
+    Dim groups As Object
+    Dim groupOrder As Collection
+    Dim inputDataCount As Long
+    Dim errorNumber As Long
+    Dim errorDescription As String
+
+    On Error GoTo Failed
+
+    ReadSettings outputHeaders, sumHeader
+
+    inputPath = ChooseInputCsvPath()
+    If Len(inputPath) = 0 Then Exit Sub
+
+    outputPath = ChooseOutputCsvPath(inputPath)
+    If Len(outputPath) = 0 Then Exit Sub
+
+    Application.StatusBar = "Shift_JISのCSVを読み込んでいます..."
+    csvText = ReadTextFile(inputPath, INPUT_CHARSET)
+
+    Application.StatusBar = "CSVの構造を解析しています..."
+    Set records = ParseCsvRecords(csvText)
+    csvText = vbNullString
+
+    BuildColumnMapping records, outputHeaders, sumHeader, _
+                       sourceIndexes, targetOutputIndex
+
+    Application.StatusBar = "データをグループ化して合計しています..."
+    AggregateRecords records, outputHeaders, sourceIndexes, _
+                     targetOutputIndex, groups, groupOrder, inputDataCount
+
+    Application.StatusBar = "Shift_JISのCSVを保存しています..."
+    WriteGroupedCsv outputPath, outputHeaders, targetOutputIndex, _
+                    groups, groupOrder
+
+    Application.StatusBar = False
+
+    MsgBox "集計が完了しました。" & vbCrLf & _
+           "入力データ件数: " & Format$(inputDataCount, "#,##0") & vbCrLf & _
+           "出力グループ数: " & Format$(groups.Count, "#,##0") & vbCrLf & _
+           "保存先: " & outputPath, _
+           vbInformation, "CSVグループ集計"
+    Exit Sub
+
+Failed:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+    Application.StatusBar = False
+
+    MsgBox "処理を中止しました。" & vbCrLf & _
+           errorDescription & vbCrLf & _
+           "エラー番号: " & CStr(errorNumber), _
+           vbCritical, "CSVグループ集計"
+End Sub
+
+' 設定の読み込み
+
+
+Private Sub ReadSettings(ByRef outputHeaders() As String, _
+                         ByRef sumHeader As String)
+    Dim ws As Worksheet
+    Dim lastRow As Long
+    Dim rowNumber As Long
+    Dim headerCount As Long
+    Dim headerName As String
+    Dim cellValue As Variant
+    Dim seen As Object
+
+    Set ws = GetSettingsSheet()
+
+    lastRow = ws.Cells(ws.rows.Count, ORDER_COLUMN_NUMBER).End(xlUp).Row
+    If lastRow < ORDER_START_ROW Then
+        RaiseUserError "設定シートのA2以降に列名がありません。"
+    End If
+
+    ReDim outputHeaders(0 To lastRow - ORDER_START_ROW)
+
+    Set seen = CreateObject("Scripting.Dictionary")
+    seen.CompareMode = HEADER_COMPARE_MODE
+
+    For rowNumber = ORDER_START_ROW To lastRow
+        cellValue = ws.Cells(rowNumber, ORDER_COLUMN_NUMBER).Value2
+
+        If IsError(cellValue) Then
+            RaiseUserError "設定シートA" & CStr(rowNumber) & _
+                           "がExcelエラー値です。"
+        End If
+
+        headerName = NormalizeHeaderName(CStr(cellValue))
+
+        If Len(headerName) = 0 Then
+            RaiseUserError "設定シートの列名一覧に空行があります。" & _
+                           "A2から最終行までは空行を入れないでください。" & _
+                           " 対象セル: A" & CStr(rowNumber)
+        End If
+
+        If seen.Exists(headerName) Then
+            RaiseUserError "設定シートA列に列名が重複しています: " & _
+                           headerName
+        End If
+
+        seen.Add headerName, True
+        outputHeaders(headerCount) = headerName
+        headerCount = headerCount + 1
+    Next rowNumber
+
+    cellValue = ws.Range(SUM_COLUMN_NAME_CELL).Value2
+    If IsError(cellValue) Then
+        RaiseUserError "設定シート" & SUM_COLUMN_NAME_CELL & _
+                       "がExcelエラー値です。"
+    End If
+
+    sumHeader = NormalizeHeaderName(CStr(cellValue))
+    If Len(sumHeader) = 0 Then
+        RaiseUserError "設定シート" & SUM_COLUMN_NAME_CELL & _
+                       "に合計対象の列名を入力してください。"
+    End If
+
+    If Not seen.Exists(sumHeader) Then
+        RaiseUserError "合計対象列「" & sumHeader & _
+                       "」が設定シートA列の出力列一覧にありません。"
+    End If
+End Sub
+
+Private Function GetSettingsSheet() As Worksheet
+    Dim ws As Worksheet
+
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(SETTINGS_SHEET_NAME)
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        RaiseUserError "シート「" & SETTINGS_SHEET_NAME & _
+                       "」が見つかりません。"
+    End If
+
+    Set GetSettingsSheet = ws
+End Function
+
+' ファイル選択
+
+Private Function ChooseInputCsvPath() As String
+    Dim selectedPath As Variant
+
+    selectedPath = Application.GetOpenFilename( _
+        FileFilter:="CSVファイル (*.csv),*.csv,すべてのファイル (*.*),*.*", _
+        Title:="グループ化するShift_JISのCSVを選択してください", _
+        MultiSelect:=False)
+
+    If VarType(selectedPath) = vbBoolean Then
+        ChooseInputCsvPath = vbNullString
+    Else
+        ChooseInputCsvPath = CStr(selectedPath)
+    End If
+End Function
+
+Private Function ChooseOutputCsvPath(ByVal inputPath As String) As String
+    Dim selectedPath As Variant
+    Dim initialPath As String
+    Dim candidatePath As String
+
+    initialPath = BuildDefaultOutputPath(inputPath)
+
+    Do
+        selectedPath = Application.GetSaveAsFilename( _
+            InitialFileName:=initialPath, _
+            FileFilter:="CSVファイル (*.csv),*.csv", _
+            Title:="集計後のShift_JIS CSVの保存先を指定してください")
+
+        If VarType(selectedPath) = vbBoolean Then
+            ChooseOutputCsvPath = vbNullString
+            Exit Function
+        End If
+
+        candidatePath = CStr(selectedPath)
+        If LCase$(Right$(candidatePath, 4)) <> ".csv" Then
+            candidatePath = candidatePath & ".csv"
+        End If
+
+        If SamePath(candidatePath, inputPath) Then
+            MsgBox "入力CSVと同じファイルには上書きできません。" & vbCrLf & _
+                   "別の保存先を指定してください。", _
+                   vbExclamation, "CSVグループ集計"
+            initialPath = candidatePath
+        Else
+            ChooseOutputCsvPath = candidatePath
+            Exit Function
+        End If
+    Loop
+End Function
+
+Private Function BuildDefaultOutputPath(ByVal inputPath As String) As String
+    Dim fso As Object
+    Dim parentFolder As String
+    Dim baseName As String
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    parentFolder = fso.GetParentFolderName(inputPath)
+    baseName = fso.GetBaseName(inputPath)
+
+    BuildDefaultOutputPath = fso.BuildPath( _
+        parentFolder, baseName & DEFAULT_OUTPUT_SUFFIX & ".csv")
+End Function
+
+Private Function SamePath(ByVal firstPath As String, _
+                          ByVal secondPath As String) As Boolean
+    Dim fso As Object
+    Dim firstAbsolute As String
+    Dim secondAbsolute As String
+
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    firstAbsolute = fso.GetAbsolutePathName(firstPath)
+    secondAbsolute = fso.GetAbsolutePathName(secondPath)
+
+    SamePath = (StrComp(firstAbsolute, secondAbsolute, _
+                        vbTextCompare) = 0)
+End Function
+
+' Shift_JISテキストの読み込み
+
+Private Function ReadTextFile(ByVal filePath As String, _
+                              ByVal charsetName As String) As String
+    Dim stream As Object
+    Dim errorNumber As Long
+    Dim errorDescription As String
+
+    On Error GoTo Failed
+
+    Set stream = CreateObject("ADODB.Stream")
+    stream.Type = AD_TYPE_TEXT
+    stream.Charset = charsetName
+    stream.Open
+    stream.LoadFromFile filePath
+
+    ReadTextFile = stream.ReadText
+    stream.Close
+    Exit Function
+
+Failed:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+
+    Err.Raise errorNumber, "ReadTextFile", _
+              "CSVを読み込めませんでした: " & filePath & vbCrLf & _
+              errorDescription
+End Function
+
+' CSV解析
+'
+' ・引用符内のカンマ、CR/LF、二重引用符（""）に対応します。
+' ・空の物理行は無視します。
+' ・引用符を閉じた後に区切り文字または改行以外があるCSVはエラーにします。
+
+Private Function ParseCsvRecords(ByVal csvText As String) As Collection
+    Dim records As New Collection
+    Dim fields As New Collection
+    Dim fieldValue As String
+    Dim character As String
+    Dim position As Long
+    Dim textLength As Long
+    Dim inQuotes As Boolean
+    Dim fieldStarted As Boolean
+    Dim recordStarted As Boolean
+    Dim afterClosingQuote As Boolean
+
+    textLength = Len(csvText)
+    position = 1
+
+    Do While position <= textLength
+        character = Mid$(csvText, position, 1)
+
+        If inQuotes Then
+            If character = """" Then
+                If position < textLength And _
+                   Mid$(csvText, position + 1, 1) = """" Then
+                    fieldValue = fieldValue & """"
+                    position = position + 1
+                Else
+                    inQuotes = False
+                    afterClosingQuote = True
+                End If
+            Else
+                fieldValue = fieldValue & character
+            End If
+        Else
+            Select Case character
+                Case """"
+                    If fieldStarted Or afterClosingQuote Then
+                        RaiseUserError "CSVレコード" & _
+                            CStr(records.Count + 1) & _
+                            "の引用符の位置が不正です。"
+                    End If
+
+                    inQuotes = True
+                    fieldStarted = True
+                    recordStarted = True
+
+                Case CSV_DELIMITER
+                    fields.Add fieldValue
+                    fieldValue = vbNullString
+                    fieldStarted = False
+                    afterClosingQuote = False
+                    recordStarted = True
+
+                Case vbCr, vbLf
+                    If recordStarted Or fields.Count > 0 Or _
+                       Len(fieldValue) > 0 Then
+                        fields.Add fieldValue
+                        records.Add CollectionToStringArray(fields)
+                    End If
+
+                    Set fields = New Collection
+                    fieldValue = vbNullString
+                    fieldStarted = False
+                    recordStarted = False
+                    afterClosingQuote = False
+
+                    If character = vbCr And position < textLength Then
+                        If Mid$(csvText, position + 1, 1) = vbLf Then
+                            position = position + 1
+                        End If
+                    End If
+
+                Case Else
+                    If afterClosingQuote Then
+                        RaiseUserError "CSVレコード" & _
+                            CStr(records.Count + 1) & _
+                            "で、閉じ引用符の後に不正な文字があります。"
+                    End If
+
+                    fieldValue = fieldValue & character
+                    fieldStarted = True
+                    recordStarted = True
+            End Select
+        End If
+
+        position = position + 1
+    Loop
+
+    If inQuotes Then
+        RaiseUserError "CSVレコード" & CStr(records.Count + 1) & _
+                       "の引用符が閉じていません。"
+    End If
+
+    If recordStarted Or fields.Count > 0 Or Len(fieldValue) > 0 Then
+        fields.Add fieldValue
+        records.Add CollectionToStringArray(fields)
+    End If
+
+    Set ParseCsvRecords = records
+End Function
+
+Private Function CollectionToStringArray(ByVal values As Collection) As Variant
+    Dim result() As String
+    Dim index As Long
+
+    ReDim result(0 To values.Count - 1)
+    For index = 1 To values.Count
+        result(index - 1) = CStr(values(index))
+    Next index
+
+    CollectionToStringArray = result
+End Function
+
+' 列検証とマッピング
+
+Private Sub BuildColumnMapping(ByVal records As Collection, _
+                               ByRef outputHeaders() As String, _
+                               ByVal sumHeader As String, _
+                               ByRef sourceIndexes() As Long, _
+                               ByRef targetOutputIndex As Long)
+    Dim sourceHeader As Variant
+    Dim headerMap As Object
+    Dim sourceColumnCount As Long
+    Dim outputColumnCount As Long
+    Dim index As Long
+    Dim normalizedName As String
+
+    If records.Count = 0 Then
+        RaiseUserError "CSVに見出し行がありません。"
+    End If
+
+    sourceHeader = records(1)
+    sourceColumnCount = ArrayElementCount(sourceHeader)
+    outputColumnCount = UBound(outputHeaders) - _
+                        LBound(outputHeaders) + 1
+
+    Set headerMap = CreateObject("Scripting.Dictionary")
+    headerMap.CompareMode = HEADER_COMPARE_MODE
+
+    For index = LBound(sourceHeader) To UBound(sourceHeader)
+        normalizedName = NormalizeHeaderName( _
+            CStr(sourceHeader(index)))
+
+        If Len(normalizedName) = 0 Then
+            RaiseUserError "CSVの見出しに空欄があります。列番号: " & _
+                           CStr(index - LBound(sourceHeader) + 1)
+        End If
+
+        If headerMap.Exists(normalizedName) Then
+            RaiseUserError "CSVの見出しが重複しています: " & _
+                           normalizedName
+        End If
+
+        headerMap.Add normalizedName, index
+    Next index
+
+    If sourceColumnCount <> outputColumnCount Then
+        RaiseUserError "設定シートA列とCSVの列数が一致しません。" & _
+                       vbCrLf & "設定: " & CStr(outputColumnCount) & _
+                       "列 / CSV: " & CStr(sourceColumnCount) & "列"
+    End If
+
+    ReDim sourceIndexes(LBound(outputHeaders) To UBound(outputHeaders))
+    targetOutputIndex = -1
+
+    For index = LBound(outputHeaders) To UBound(outputHeaders)
+        If Not headerMap.Exists(outputHeaders(index)) Then
+            RaiseUserError "設定シートにある列がCSVにありません: " & _
+                           outputHeaders(index)
+        End If
+
+        sourceIndexes(index) = CLng(headerMap(outputHeaders(index)))
+
+        If StrComp(outputHeaders(index), sumHeader, _
+                   vbTextCompare) = 0 Then
+            targetOutputIndex = index
+        End If
+    Next index
+
+    If targetOutputIndex < 0 Then
+        RaiseUserError "合計対象列を特定できません: " & sumHeader
+    End If
+End Sub
+
+' グループ化と合計
+
+Private Sub AggregateRecords(ByVal records As Collection, _
+                             ByRef outputHeaders() As String, _
+                             ByRef sourceIndexes() As Long, _
+                             ByVal targetOutputIndex As Long, _
+                             ByRef groups As Object, _
+                             ByRef groupOrder As Collection, _
+                             ByRef inputDataCount As Long)
+    Dim recordNumber As Long
+    Dim expectedColumnCount As Long
+    Dim rowData As Variant
+    Dim groupKey As String
+    Dim amount As Variant
+    Dim groupedRow As Variant
+    Dim newRow() As Variant
+    Dim outputIndex As Long
+
+    Set groups = CreateObject("Scripting.Dictionary")
+    groups.CompareMode = GROUP_COMPARE_MODE
+    Set groupOrder = New Collection
+
+    expectedColumnCount = ArrayElementCount(records(1))
+
+    For recordNumber = 2 To records.Count
+        rowData = records(recordNumber)
+
+        If ArrayElementCount(rowData) <> expectedColumnCount Then
+            RaiseUserError "CSVレコード" & CStr(recordNumber) & _
+                           "の列数が見出しと一致しません。" & _
+                           vbCrLf & "見出し: " & _
+                           CStr(expectedColumnCount) & "列 / データ: " & _
+                           CStr(ArrayElementCount(rowData)) & "列"
+        End If
+
+        groupKey = BuildGroupKey(rowData, sourceIndexes, _
+                                 targetOutputIndex)
+
+        amount = ParseDecimalAmount( _
+            CStr(rowData(sourceIndexes(targetOutputIndex))), _
+            recordNumber, outputHeaders(targetOutputIndex))
+
+        If groups.Exists(groupKey) Then
+            groupedRow = groups(groupKey)
+            groupedRow(targetOutputIndex) = AddDecimalValues( _
+                groupedRow(targetOutputIndex), amount, recordNumber)
+            groups(groupKey) = groupedRow
+        Else
+            ReDim newRow(LBound(outputHeaders) To UBound(outputHeaders))
+
+            For outputIndex = LBound(outputHeaders) To _
+                              UBound(outputHeaders)
+                newRow(outputIndex) = CStr( _
+                    rowData(sourceIndexes(outputIndex)))
+            Next outputIndex
+
+            newRow(targetOutputIndex) = amount
+            groups.Add groupKey, newRow
+            groupOrder.Add groupKey
+        End If
+
+        inputDataCount = inputDataCount + 1
+
+        If inputDataCount Mod 10000 = 0 Then
+            Application.StatusBar = "データをグループ化しています... " & _
+                                    Format$(inputDataCount, "#,##0") & "件"
+            DoEvents
+        End If
+    Next recordNumber
+End Sub
+
+Private Function BuildGroupKey(ByVal rowData As Variant, _
+                               ByRef sourceIndexes() As Long, _
+                               ByVal targetOutputIndex As Long) As String
+    Dim outputIndex As Long
+    Dim value As String
+    Dim key As String
+
+    For outputIndex = LBound(sourceIndexes) To UBound(sourceIndexes)
+        If outputIndex <> targetOutputIndex Then
+            value = CStr(rowData(sourceIndexes(outputIndex)))
+
+            ' 長さを付けることで、値に区切り文字が含まれても衝突しません。
+            key = key & CStr(Len(value)) & ":" & value & "|"
+        End If
+    Next outputIndex
+
+    BuildGroupKey = key
+End Function
+
+Private Function ParseDecimalAmount(ByVal rawValue As String, _
+                                    ByVal recordNumber As Long, _
+                                    ByVal columnName As String) As Variant
+    Static numberPattern As Object
+    Dim value As String
+    Dim conversionValue As String
+    Dim localDecimalSeparator As String
+    Dim errorDescription As String
+
+    value = Trim$(rawValue)
+
+    If Len(value) = 0 Then
+        If BLANK_SUM_VALUE_IS_ZERO Then
+            ParseDecimalAmount = CDec(0)
+            Exit Function
+        Else
+            RaiseUserError "CSVレコード" & CStr(recordNumber) & _
+                           "の合計列「" & columnName & "」が空欄です。"
+        End If
+    End If
+
+    If numberPattern Is Nothing Then
+        Set numberPattern = CreateObject("VBScript.RegExp")
+        numberPattern.Global = False
+        numberPattern.IgnoreCase = True
+        numberPattern.Pattern = _
+            "^[+-]?(((\d{1,3}(,\d{3})+)|\d+)(\.\d+)?|\.\d+)$"
+    End If
+
+    If Not numberPattern.Test(value) Then
+        RaiseUserError "CSVレコード" & CStr(recordNumber) & _
+                       "の合計列「" & columnName & _
+                       "」が数値ではありません: " & rawValue
+    End If
+
+    conversionValue = Replace$(value, ",", vbNullString)
+    localDecimalSeparator = CStr( _
+        Application.International(xlDecimalSeparator))
+
+    If localDecimalSeparator <> "." Then
+        conversionValue = Replace$(conversionValue, ".", _
+                                   localDecimalSeparator)
+    End If
+
+    On Error GoTo ConversionFailed
+    ParseDecimalAmount = CDec(conversionValue)
+    On Error GoTo 0
+    Exit Function
+
+ConversionFailed:
+    errorDescription = Err.Description
+    On Error GoTo 0
+
+    RaiseUserError "CSVレコード" & CStr(recordNumber) & _
+                   "の合計列「" & columnName & _
+                   "」をDecimal型へ変換できません: " & rawValue & _
+                   vbCrLf & errorDescription
+End Function
+
+Private Function AddDecimalValues(ByVal firstValue As Variant, _
+                                  ByVal secondValue As Variant, _
+                                  ByVal recordNumber As Long) As Variant
+    Dim errorDescription As String
+
+    On Error GoTo AdditionFailed
+    AddDecimalValues = CDec(firstValue) + CDec(secondValue)
+    On Error GoTo 0
+    Exit Function
+
+AdditionFailed:
+    errorDescription = Err.Description
+    On Error GoTo 0
+
+    RaiseUserError "CSVレコード" & CStr(recordNumber) & _
+                   "の加算中に桁あふれが発生しました。" & vbCrLf & _
+                   errorDescription
+End Function
+
+' Shift_JIS CSVの出力
+
+Private Sub WriteGroupedCsv(ByVal outputPath As String, _
+                            ByRef outputHeaders() As String, _
+                            ByVal targetOutputIndex As Long, _
+                            ByVal groups As Object, _
+                            ByVal groupOrder As Collection)
+    Dim stream As Object
+    Dim orderIndex As Long
+    Dim groupedRow As Variant
+    Dim errorNumber As Long
+    Dim errorDescription As String
+
+    On Error GoTo Failed
+
+    Set stream = CreateObject("ADODB.Stream")
+    stream.Type = AD_TYPE_TEXT
+    stream.Charset = OUTPUT_CHARSET
+    stream.Open
+    stream.LineSeparator = AD_CRLF
+
+    stream.WriteText BuildHeaderCsvLine(outputHeaders), AD_WRITE_LINE
+
+    For orderIndex = 1 To groupOrder.Count
+        groupedRow = groups(groupOrder(orderIndex))
+        stream.WriteText BuildDataCsvLine( _
+            groupedRow, targetOutputIndex), AD_WRITE_LINE
+    Next orderIndex
+
+    stream.SaveToFile outputPath, AD_SAVE_CREATE_OVERWRITE
+    stream.Close
+    Exit Sub
+
+Failed:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+
+    Err.Raise errorNumber, "WriteGroupedCsv", _
+              "CSVを保存できませんでした: " & outputPath & vbCrLf & _
+              errorDescription
+End Sub
+
+Private Function BuildHeaderCsvLine( _
+    ByRef outputHeaders() As String) As String
+
+    Dim escapedFields() As String
+    Dim index As Long
+
+    ReDim escapedFields(LBound(outputHeaders) To UBound(outputHeaders))
+
+    For index = LBound(outputHeaders) To UBound(outputHeaders)
+        escapedFields(index) = EscapeCsvField(outputHeaders(index))
+    Next index
+
+    BuildHeaderCsvLine = Join(escapedFields, CSV_DELIMITER)
+End Function
+
+Private Function BuildDataCsvLine(ByVal groupedRow As Variant, _
+                                  ByVal targetOutputIndex As Long) As String
+    Dim escapedFields() As String
+    Dim index As Long
+    Dim value As String
+
+    ReDim escapedFields(LBound(groupedRow) To UBound(groupedRow))
+
+    For index = LBound(groupedRow) To UBound(groupedRow)
+        If index = targetOutputIndex Then
+            value = DecimalToInvariantText(groupedRow(index))
+        Else
+            value = CStr(groupedRow(index))
+        End If
+
+        escapedFields(index) = EscapeCsvField(value)
+    Next index
+
+    BuildDataCsvLine = Join(escapedFields, CSV_DELIMITER)
+End Function
+
+Private Function EscapeCsvField(ByVal value As String) As String
+    Dim needsQuotes As Boolean
+
+    needsQuotes = (InStr(1, value, CSV_DELIMITER, vbBinaryCompare) > 0) _
+                  Or (InStr(1, value, """", vbBinaryCompare) > 0) _
+                  Or (InStr(1, value, vbCr, vbBinaryCompare) > 0) _
+                  Or (InStr(1, value, vbLf, vbBinaryCompare) > 0)
+
+    If Len(value) > 0 Then
+        needsQuotes = needsQuotes _
+                      Or (Left$(value, 1) = " ") _
+                      Or (Right$(value, 1) = " ")
+    End If
+
+    If needsQuotes Then
+        EscapeCsvField = """" & _
+                         Replace$(value, """", """""") & """"
+    Else
+        EscapeCsvField = value
+    End If
+End Function
+
+Private Function DecimalToInvariantText(ByVal value As Variant) As String
+    Dim result As String
+    Dim localDecimalSeparator As String
+
+    result = CStr(CDec(value))
+    localDecimalSeparator = CStr( _
+        Application.International(xlDecimalSeparator))
+
+    If localDecimalSeparator <> "." Then
+        result = Replace$(result, localDecimalSeparator, ".")
+    End If
+
+    DecimalToInvariantText = result
+End Function
+
+' 共通処理
+
+Private Function NormalizeHeaderName(ByVal value As String) As String
+    value = Trim$(value)
+
+    ' UTF系CSVが誤って渡された場合などに先頭へ付くBOMを除去します。
+    If Len(value) > 0 Then
+        If AscW(Left$(value, 1)) = -257 Then
+            value = Mid$(value, 2)
+        End If
+    End If
+
+    NormalizeHeaderName = value
+End Function
+
+Private Function ArrayElementCount(ByVal values As Variant) As Long
+    ArrayElementCount = UBound(values) - LBound(values) + 1
+End Function
+
+Private Sub RaiseUserError(ByVal message As String)
+    Err.Raise vbObjectError + 2101, "CSVグループ集計", message
+End Sub
