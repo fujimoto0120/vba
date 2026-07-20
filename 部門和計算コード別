@@ -1,17 +1,4 @@
-Option Explicit
-
-' CSV取込と組合せ計算（改善版）
-'
-' 【処理概要】
-'   1. CSVファイルを選択して読み込む
-'   2. 「商品識別コード」「表示品名」「受注数」の列を探す
-'   3. 商品識別コードの一部を抽出し、コードごとに受注数をまとめる
-'   4. 各コードについて、受注数から作成できる合計値を計算する
-'   5. 取込内容を「出力」シート、計算内容を「計算結果」シートへ出力する
-'
-' 【重要】
-'   出力先には ActiveWorkbook ではなく ThisWorkbook を使用しています。
-'   つまり、このコードを保存しているブックが出力先になります。
+0 出力先になります｡
 '   PERSONAL.XLSBやアドインへ入れる場合は、対象ブックの指定方法を
 '   運用に合わせて見直してください。
 '＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿
@@ -25,7 +12,7 @@ Private Const IMPORT_SHEET_NAME As String = "出力"
 '組合せ計算の結果を表示するシート名
 Private Const RESULT_SHEET_NAME As String = "計算結果"
 
-'商品識別コードから使用部分を取り出す位置と文字数
+'型番コードから使用部分を取り出す位置と文字数
 '現在は「7文字目から4文字」を抽出する
 Private Const CODE_START_POSITION As Long = 7
 Private Const CODE_CHARACTER_COUNT As Long = 4
@@ -166,9 +153,9 @@ Public Sub CSV取込と組合せ計算()
             "必要な列名が見つかりませんでした。" & _
             vbCrLf & vbCrLf & _
             "必要な列名：" & vbCrLf & _
-            "・商品識別コード" & vbCrLf & _
-            "・表示品名" & vbCrLf & _
-            "・受注数"
+            "・型番コード" & vbCrLf & _
+            "・商品の名前" & vbCrLf & _
+            "・売れてる数"
 
         GoTo Cleanup
 
@@ -179,7 +166,7 @@ Public Sub CSV取込と組合せ計算()
         GoTo Cleanup
     End If
 
-    '商品コードをキーとして、受注数と商品名を保持する
+    '商品コードをキーとして、売れてる数と商品名を保持する
     Set groups = CreateObject("Scripting.Dictionary")
     groups.CompareMode = vbBinaryCompare
 
@@ -346,9 +333,9 @@ Private Sub BuildImportData( _
                     vbObjectError + 1001, _
                     "BuildImportData", _
                     "CSVの" & rowIndex & _
-                    "行目にある商品識別コードが短すぎます。" & _
+                    "行目にある型番コードが短すぎます。" & _
                     vbCrLf & _
-                    "商品識別コード：" & fullProductCode
+                    "型番コード：" & fullProductCode
 
             End If
 
@@ -367,11 +354,11 @@ Private Sub BuildImportData( _
                     "CSVの" & rowIndex & _
                     "行目から抽出した商品コードが空欄です。" & _
                     vbCrLf & _
-                    "商品識別コード：" & fullProductCode
+                    "型番コード：" & fullProductCode
 
             End If
 
-            '受注数を、正の整数かつ安全に計算できる範囲へ制限する
+            '売れてる数を、正の整数かつ安全に計算できる範囲へ制限する
             If Not TryParsePositiveInteger( _
                 quantityText, quantityValue, invalidReason) Then
 
@@ -379,7 +366,7 @@ Private Sub BuildImportData( _
                     vbObjectError + 1003, _
                     "BuildImportData", _
                     "CSVの" & rowIndex & _
-                    "行目の受注数が正しくありません。" & _
+                    "行目の売れてる数が正しくありません。" & _
                     vbCrLf & _
                     "入力値：" & quantityText & vbCrLf & _
                     "理由：" & invalidReason
@@ -393,7 +380,7 @@ Private Sub BuildImportData( _
             importData(importCount, 2) = MakeSafeExcelText(productName)
             importData(importCount, 3) = quantityValue
 
-            '同じ抽出コードに属する受注数をCollectionへまとめる
+            '同じ抽出コードに属する売れてる数をCollectionへまとめる
             If Not groups.Exists(extractedCode) Then
 
                 Set orderValues = New Collection
@@ -426,7 +413,7 @@ Private Sub BuildImportData( _
 End Sub
 
 
-' 受注数の文字列を検証してDouble型へ変換する
+' 売れてる数の文字列を検証してDouble型へ変換する
 '
 ' 戻り値：
 '   True  = 正常。parsedValueへ変換結果を返す
@@ -502,9 +489,9 @@ Private Sub WriteImportSheet( _
         .Cells.Clear
 
         '見出し
-        .Range("A1").Value2 = "商品識別コード"
-        .Range("B1").Value2 = "表示品名"
-        .Range("C1").Value2 = "受注数"
+        .Range("A1").Value2 = "型番コード"
+        .Range("B1").Value2 = "商品の名前"
+        .Range("C1").Value2 = "売れてる数"
 
         'コードと商品名は、数式や数値ではなく文字列として扱う
         .Range("A2:B" & lastRow).NumberFormat = "@"
@@ -513,7 +500,7 @@ Private Sub WriteImportSheet( _
         .Range("A2").Resize( _
             importCount, 3).Value2 = importData
 
-        '受注数の表示形式
+        '売れてる数の表示形式
         .Range("C2:C" & lastRow).NumberFormat = "#,##0"
 
         '見出しの書式
@@ -573,7 +560,7 @@ Private Sub WriteResultSheet( _
 
     codeKeys = groups.Keys
 
-    '商品識別コードを文字列の昇順に並べ替える
+    '型番コードを文字列の昇順に並べ替える
     If groups.Count > 1 Then
         QuickSortText codeKeys, LBound(codeKeys), UBound(codeKeys)
     End If
@@ -598,7 +585,7 @@ Private Sub WriteResultSheet( _
         '   その合計値を作る直前の合計値を保持する
         '
         'usedItem：
-        '   その合計値を作る最後の受注数の位置を保持する
+        '   その合計値を作る最後の売れてる数の位置を保持する
         Set reachable = CreateObject("Scripting.Dictionary")
         Set previousSum = CreateObject("Scripting.Dictionary")
         Set usedItem = CreateObject("Scripting.Dictionary")
@@ -635,7 +622,7 @@ Private Sub WriteResultSheet( _
                 "商品コード：" & currentCode
 
             .Cells(outputRow + 1, 1).Value2 = _
-                "表示品名：" & CStr(productNames(currentCode))
+                "商品の名前：" & CStr(productNames(currentCode))
 
             .Cells(outputRow, 2).Value2 = "作れる数字"
             .Cells(outputRow, 3).Value2 = "組み合わせ例"
@@ -754,12 +741,12 @@ End Sub
 
 ' 商品コードごとに作成可能な合計値を計算する
 '
-' 例：受注数が 10、20、30 の場合
+' 例：売れてる数が 10、20、30 の場合
 '   0、10、20、30、40、50、60 がreachableへ登録される
 '
-' 同じ受注数が複数行ある場合は、各行を別の項目として1回ずつ使用できる。
+' 同じ売れてる数が複数行ある場合は、各行を別の項目として1回ずつ使用できる。
 ' 追加前のreachable.Keysを複製してから処理することにより、
-' 1つの受注数を同じ計算段階で複数回使うことを防いでいる。
+' 1つの売れてる数を同じ計算段階で複数回使うことを防いでいる。
 
 Private Sub CalculateReachableSums( _
     ByVal orderValues As Collection, _
@@ -819,7 +806,7 @@ Private Sub CalculateReachableSums( _
                         "」の作成可能な数字が、上限の" & _
                         Format$(maxUniqueValues, "#,##0") & _
                         "件を超えました。" & vbCrLf & _
-                        "対象となる受注数を減らすか、" & _
+                        "対象となる売れてる数を減らすか、" & _
                         "MAX_UNIQUE_VALUESを見直してください。"
 
                 End If
@@ -850,7 +837,7 @@ Private Function GetPossibleSums( _
     Dim resultCount As Long
     Dim keyIndex As Long
 
-    '受注数は正の整数なので、正常なら0以外の合計が少なくとも1件存在する
+    '売れてる数は正の整数なので、正常なら0以外の合計が少なくとも1件存在する
     If reachable.Count <= 1 Then
 
         Err.Raise _
@@ -1275,7 +1262,7 @@ Private Function FindHeaderRow( _
 
             Select Case headerText
 
-                Case "表示品名"
+                Case "商品の名前"
 
                     productHeaderCount = productHeaderCount + 1
 
@@ -1283,7 +1270,7 @@ Private Function FindHeaderRow( _
                         productCol = columnIndex
                     End If
 
-                Case "商品識別コード"
+                Case "型番コード"
 
                     codeHeaderCount = codeHeaderCount + 1
 
@@ -1291,7 +1278,7 @@ Private Function FindHeaderRow( _
                         codeCol = columnIndex
                     End If
 
-                Case "受注数"
+                Case "売れてる数"
 
                     quantityHeaderCount = quantityHeaderCount + 1
 
@@ -1590,7 +1577,7 @@ Private Sub QuickSortDouble( _
 End Sub
 
 
-' 商品識別コードの配列を文字列の昇順へ並べ替える
+' 型番コードの配列を文字列の昇順へ並べ替える
 
 Private Sub QuickSortText( _
     ByRef values As Variant, _
@@ -1651,5 +1638,4 @@ Private Sub QuickSortText( _
     End If
 
 End Sub
-
 
