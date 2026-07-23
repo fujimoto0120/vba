@@ -1,0 +1,1108 @@
+Option Explicit
+
+' 変えそうなところはここ
+Private Const INPUT_SHEET_NAME As String = "todo追加"
+Private Const TODO_SHEET_NAME As String = "ToDoリスト"
+Private Const DONE_SHEET_NAME As String = "完了済み"
+Private Const DAILY_SHEET_NAME As String = "毎日行う業務"
+
+Private Const HEADER_ROW As Long = 2
+Private Const FIRST_DATA_ROW As Long = 3
+Private Const INPUT_ROW As Long = 3
+
+Private Const COL_TODO_DATE As Long = 2
+Private Const COL_ACTUAL_DATE As Long = 3
+Private Const COL_NO As Long = 4
+Private Const COL_TASK As Long = 5
+Private Const COL_CHECK As Long = 6
+
+Private Const DATE_LIST_COLUMN As Long = 24
+Private Const DATE_LIST_FIRST_ROW As Long = 2
+Private Const DAILY_STATUS_COLUMN As Long = 6
+Private Const DAILY_LAST_DATE_COLUMN As Long = 7
+Private Const DAILY_STATUS_ON As String = "有効"
+Private Const DAILY_STATUS_OFF As String = "停止"
+Private Const CHECKBOX_PREFIX As String = "todoCheck_"
+Private Const ADD_BUTTON_NAME As String = "todoAddButton"
+Private Const DELETE_BUTTON_NAME As String = "oldDoneDeleteButton"
+Private Const DAILY_BUTTON_NAME As String = "dailyTodoAddButton"
+Private Const DATE_DISPLAY_FORMAT As String = "yyyy/mm/dd"
+Private Const DELETE_DATE_COLUMN As Long = 2
+
+Public Sub Auto_Open()
+    初期設定
+End Sub
+
+Public Sub 初期設定()
+    Dim wsInput As Worksheet
+    Dim wsTodo As Worksheet
+    Dim wsDone As Worksheet
+    Dim wsDaily As Worksheet
+    Dim dailyAddCount As Long
+
+    On Error GoTo ErrHandler
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+
+    Set wsInput = シートを用意(INPUT_SHEET_NAME)
+    Set wsTodo = シートを用意(TODO_SHEET_NAME)
+    Set wsDone = シートを用意(DONE_SHEET_NAME)
+    Set wsDaily = シートを用意(DAILY_SHEET_NAME)
+
+    wsInput.Move Before:=ThisWorkbook.Worksheets(1)
+    wsTodo.Move After:=wsInput
+    wsDone.Move After:=wsTodo
+    wsDaily.Move After:=wsDone
+
+    入力シートの体裁を作る wsInput
+    一覧シートの体裁を作る wsTodo, False
+    一覧シートの体裁を作る wsDone, True
+    毎日業務シートの体裁を作る wsDaily
+
+    日付候補を更新
+    追加ボタンを作る
+    削除ボタンを作る
+    毎日業務ボタンを作る
+
+    チェック欄を削除 wsTodo
+    チェック欄を削除 wsDone
+    dailyAddCount = 毎日業務を追加する
+    納期順に並び替える wsTodo
+    納期順に並び替える wsDone
+    チェック欄を作り直す wsTodo
+    チェック欄を作り直す wsDone
+    集計を更新
+
+    wsInput.Activate
+    wsInput.Cells(INPUT_ROW, COL_TODO_DATE).Select
+
+ExitPoint:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+
+ErrHandler:
+    MsgBox "初期設定で止まった。" & vbCrLf & Err.Description, vbExclamation
+    Resume ExitPoint
+End Sub
+
+Public Sub Todoを追加()
+    Dim wsInput As Worksheet
+    Dim wsTodo As Worksheet
+    Dim nextRow As Long
+
+    On Error GoTo ErrHandler
+
+    If Not 必要なシートがある Then
+        MsgBox "先に「初期設定」を実行して。", vbExclamation
+        Exit Sub
+    End If
+
+    Set wsInput = ThisWorkbook.Worksheets(INPUT_SHEET_NAME)
+    Set wsTodo = ThisWorkbook.Worksheets(TODO_SHEET_NAME)
+
+    If Len(Trim$(CStr(wsInput.Cells(INPUT_ROW, COL_TODO_DATE).Value))) = 0 Then
+        MsgBox "ToDo納期を選んで。", vbExclamation
+        Exit Sub
+    End If
+
+    If Not IsDate(wsInput.Cells(INPUT_ROW, COL_TODO_DATE).Value) Then
+        MsgBox "ToDo納期が日付になってない。", vbExclamation
+        Exit Sub
+    End If
+
+    If Len(Trim$(CStr(wsInput.Cells(INPUT_ROW, COL_ACTUAL_DATE).Value))) > 0 Then
+        If Not IsDate(wsInput.Cells(INPUT_ROW, COL_ACTUAL_DATE).Value) Then
+            MsgBox "実納期が日付になってない。", vbExclamation
+            Exit Sub
+        End If
+    End If
+
+    If Len(Trim$(CStr(wsInput.Cells(INPUT_ROW, COL_TASK).Value))) = 0 Then
+        MsgBox "「行うこと」を入力して。", vbExclamation
+        Exit Sub
+    End If
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+
+    チェック欄を削除 wsTodo
+
+    nextRow = 次のデータ行(wsTodo)
+    行の書式を整える wsTodo, nextRow
+
+    wsTodo.Cells(nextRow, COL_TODO_DATE).Resize(1, 4).Value = _
+        wsInput.Cells(INPUT_ROW, COL_TODO_DATE).Resize(1, 4).Value
+    wsTodo.Cells(nextRow, COL_CHECK).ClearContents
+
+    wsInput.Cells(INPUT_ROW, COL_TODO_DATE).Resize(1, 4).ClearContents
+
+    納期順に並び替える wsTodo
+    チェック欄を作り直す wsTodo
+    集計を更新
+
+    wsInput.Activate
+    wsInput.Cells(INPUT_ROW, COL_TODO_DATE).Select
+    MsgBox "ToDoリストに追加した。", vbInformation
+
+ExitPoint:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+
+ErrHandler:
+    MsgBox "追加できなかった。" & vbCrLf & Err.Description, vbExclamation
+    Resume ExitPoint
+End Sub
+
+Public Sub 毎日業務を本日分へ追加()
+    Dim wsTodo As Worksheet
+    Dim addCount As Long
+
+    On Error GoTo ErrHandler
+
+    If Not 必要なシートがある Then
+        MsgBox "先に「初期設定」を実行して。", vbExclamation
+        Exit Sub
+    End If
+
+    Set wsTodo = ThisWorkbook.Worksheets(TODO_SHEET_NAME)
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+
+    チェック欄を削除 wsTodo
+    addCount = 毎日業務を追加する
+    納期順に並び替える wsTodo
+    チェック欄を作り直す wsTodo
+    集計を更新
+
+    MsgBox addCount & "件を本日分として追加した。", vbInformation
+
+ExitPoint:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+
+ErrHandler:
+    MsgBox "毎日業務の追加で止まった。" & vbCrLf & Err.Description, vbExclamation
+    Resume ExitPoint
+End Sub
+
+Public Sub 期限切れ完了行を削除()
+    Dim ws As Worksheet
+    Dim lastRow As Long
+    Dim rowNo As Long
+    Dim deleteCount As Long
+    Dim answer As VbMsgBoxResult
+
+    If Not 必要なシートがある Then
+        MsgBox "先に「初期設定」を実行して。", vbExclamation
+        Exit Sub
+    End If
+
+    Set ws = ThisWorkbook.Worksheets(DONE_SHEET_NAME)
+    lastRow = ws.Cells(ws.Rows.Count, DELETE_DATE_COLUMN).End(xlUp).Row
+
+    If lastRow < FIRST_DATA_ROW Then
+        MsgBox "削除する完了データはない。", vbInformation
+        Exit Sub
+    End If
+
+    answer = MsgBox( _
+        "ToDo納期が昨日以前の完了データを削除する。" & vbCrLf & _
+        "元に戻せないけど続ける？", _
+        vbYesNo + vbExclamation, _
+        "完了データの削除" _
+    )
+
+    If answer <> vbYes Then Exit Sub
+
+    On Error GoTo ErrHandler
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+
+    チェック欄を削除 ws
+
+    For rowNo = lastRow To FIRST_DATA_ROW Step -1
+        If IsDate(ws.Cells(rowNo, DELETE_DATE_COLUMN).Value) Then
+            If DateValue(ws.Cells(rowNo, DELETE_DATE_COLUMN).Value) < Date Then
+                ws.Cells(rowNo, COL_TODO_DATE).Resize(1, 5).Delete Shift:=xlUp
+                deleteCount = deleteCount + 1
+            End If
+        End If
+    Next rowNo
+
+    納期順に並び替える ws
+    チェック欄を作り直す ws
+    集計を更新
+
+    MsgBox deleteCount & "件削除した。", vbInformation
+
+ExitPoint:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+
+ErrHandler:
+    MsgBox "削除の途中で止まった。" & vbCrLf & Err.Description, vbExclamation
+    Resume ExitPoint
+End Sub
+
+Public Sub チェック切替()
+    Dim sourceSheet As Worksheet
+    Dim targetSheet As Worksheet
+    Dim clickedShape As Shape
+    Dim sourceRow As Long
+    Dim targetRow As Long
+    Dim callerName As String
+
+    On Error GoTo ErrHandler
+
+    callerName = CStr(Application.Caller)
+    Set sourceSheet = ActiveSheet
+    Set clickedShape = sourceSheet.Shapes(callerName)
+    sourceRow = clickedShape.TopLeftCell.Row
+
+    If sourceRow < FIRST_DATA_ROW Then Exit Sub
+    If Not 行にデータがある(sourceSheet, sourceRow) Then Exit Sub
+
+    If sourceSheet.Name = TODO_SHEET_NAME Then
+        Set targetSheet = ThisWorkbook.Worksheets(DONE_SHEET_NAME)
+    ElseIf sourceSheet.Name = DONE_SHEET_NAME Then
+        Set targetSheet = ThisWorkbook.Worksheets(TODO_SHEET_NAME)
+    Else
+        Exit Sub
+    End If
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+
+    チェック欄を削除 sourceSheet
+    チェック欄を削除 targetSheet
+
+    targetRow = 次のデータ行(targetSheet)
+    行の書式を整える targetSheet, targetRow
+
+    targetSheet.Cells(targetRow, COL_TODO_DATE).Resize(1, 4).Value = _
+        sourceSheet.Cells(sourceRow, COL_TODO_DATE).Resize(1, 4).Value
+    targetSheet.Cells(targetRow, COL_CHECK).ClearContents
+
+    sourceSheet.Cells(sourceRow, COL_TODO_DATE).Resize(1, 5).Delete Shift:=xlUp
+
+    納期順に並び替える sourceSheet
+    納期順に並び替える targetSheet
+    チェック欄を作り直す sourceSheet
+    チェック欄を作り直す targetSheet
+    集計を更新
+
+ExitPoint:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+
+ErrHandler:
+    MsgBox "チェックの切り替えで止まった。" & vbCrLf & Err.Description, vbExclamation
+    Resume ExitPoint
+End Sub
+
+Public Sub 日付候補を更新()
+    Dim ws As Worksheet
+    Dim d As Date
+    Dim lastDate As Date
+    Dim writeRow As Long
+    Dim validationRange As Range
+
+    Set ws = ThisWorkbook.Worksheets(INPUT_SHEET_NAME)
+
+    ws.Columns(DATE_LIST_COLUMN).Hidden = False
+    ws.Range( _
+        ws.Cells(DATE_LIST_FIRST_ROW, DATE_LIST_COLUMN), _
+        ws.Cells(DATE_LIST_FIRST_ROW + 40, DATE_LIST_COLUMN) _
+    ).ClearContents
+
+    d = Date
+    lastDate = DateAdd("m", 1, Date)
+    writeRow = DATE_LIST_FIRST_ROW
+
+    Do While d <= lastDate
+        ws.Cells(writeRow, DATE_LIST_COLUMN).Value = d
+        ws.Cells(writeRow, DATE_LIST_COLUMN).NumberFormat = DATE_DISPLAY_FORMAT
+        d = DateAdd("d", 1, d)
+        writeRow = writeRow + 1
+    Loop
+
+    Set validationRange = ws.Cells(INPUT_ROW, COL_TODO_DATE).Resize(1, 2)
+
+    With validationRange.Validation
+        .Delete
+        .Add Type:=xlValidateList, _
+             AlertStyle:=xlValidAlertStop, _
+             Operator:=xlBetween, _
+             Formula1:="=" & _
+                 ws.Cells(DATE_LIST_FIRST_ROW, DATE_LIST_COLUMN).Address & ":" & _
+                 ws.Cells(writeRow - 1, DATE_LIST_COLUMN).Address
+        .IgnoreBlank = True
+        .InCellDropdown = True
+        .InputTitle = "日付を選択"
+        .InputMessage = "本日から1か月後まで"
+        .ErrorTitle = "日付を確認"
+        .ErrorMessage = "プルダウンの日付から選んで。"
+        .ShowError = True
+    End With
+
+    validationRange.NumberFormat = DATE_DISPLAY_FORMAT
+    ws.Columns(DATE_LIST_COLUMN).Hidden = True
+End Sub
+
+Public Sub 納期順に並び替える(ByVal ws As Worksheet)
+    Dim lastRow As Long
+    Dim rowNo As Long
+
+    lastRow = 最終データ行(ws)
+    If lastRow < FIRST_DATA_ROW Then Exit Sub
+
+    ws.Range( _
+        ws.Cells(HEADER_ROW, COL_TODO_DATE), _
+        ws.Cells(lastRow, COL_CHECK) _
+    ).Sort _
+        Key1:=ws.Cells(FIRST_DATA_ROW, COL_TODO_DATE), _
+        Order1:=xlAscending, _
+        Header:=xlYes, _
+        Orientation:=xlTopToBottom
+
+    For rowNo = FIRST_DATA_ROW To lastRow
+        If 行にデータがある(ws, rowNo) Then
+            行の書式を整える ws, rowNo
+        End If
+    Next rowNo
+End Sub
+
+Public Sub チェック欄を作り直す(ByVal ws As Worksheet)
+    Dim lastRow As Long
+    Dim rowNo As Long
+    Dim targetCell As Range
+    Dim box As CheckBox
+    Dim boxSize As Double
+    Dim isDoneSheet As Boolean
+
+    チェック欄を削除 ws
+
+    lastRow = 最終データ行(ws)
+    If lastRow < FIRST_DATA_ROW Then Exit Sub
+
+    isDoneSheet = (ws.Name = DONE_SHEET_NAME)
+    boxSize = 14
+
+    For rowNo = FIRST_DATA_ROW To lastRow
+        If 行にデータがある(ws, rowNo) Then
+            Set targetCell = ws.Cells(rowNo, COL_CHECK)
+            targetCell.ClearContents
+
+            Set box = ws.CheckBoxes.Add( _
+                targetCell.Left + (targetCell.Width - boxSize) / 2, _
+                targetCell.Top + (targetCell.Height - boxSize) / 2, _
+                boxSize, _
+                boxSize _
+            )
+
+            With box
+                .Caption = vbNullString
+                .Name = CHECKBOX_PREFIX & Format$(rowNo, "00000")
+                .OnAction = マクロ名を作る("チェック切替")
+                .Placement = xlMoveAndSize
+                If isDoneSheet Then
+                    .Value = xlOn
+                Else
+                    .Value = xlOff
+                End If
+            End With
+        End If
+    Next rowNo
+End Sub
+
+Public Sub チェック欄を削除(ByVal ws As Worksheet)
+    Dim i As Long
+
+    For i = ws.CheckBoxes.Count To 1 Step -1
+        If Left$(ws.CheckBoxes(i).Name, Len(CHECKBOX_PREFIX)) = CHECKBOX_PREFIX Then
+            ws.CheckBoxes(i).Delete
+        End If
+    Next i
+End Sub
+
+Public Sub 集計を更新()
+    With ThisWorkbook.Worksheets(TODO_SHEET_NAME)
+        .Range("H3").Formula = "=MAX(0,COUNTA(B:B)-2)"
+    End With
+
+    With ThisWorkbook.Worksheets(DONE_SHEET_NAME)
+        .Range("H6").Formula = "=MAX(0,COUNTA(B:B)-2)"
+    End With
+End Sub
+
+Private Function 毎日業務を追加する() As Long
+    Dim wsDaily As Worksheet
+    Dim wsTodo As Worksheet
+    Dim lastRow As Long
+    Dim rowNo As Long
+    Dim targetRow As Long
+    Dim taskText As String
+    Dim statusText As String
+    Dim shouldAdd As Boolean
+
+    Set wsDaily = ThisWorkbook.Worksheets(DAILY_SHEET_NAME)
+    Set wsTodo = ThisWorkbook.Worksheets(TODO_SHEET_NAME)
+
+    lastRow = wsDaily.Cells(wsDaily.Rows.Count, COL_TASK).End(xlUp).Row
+    If lastRow < FIRST_DATA_ROW Then Exit Function
+
+    For rowNo = FIRST_DATA_ROW To lastRow
+        taskText = Trim$(CStr(wsDaily.Cells(rowNo, COL_TASK).Value))
+
+        If Len(taskText) > 0 Then
+            wsDaily.Cells(rowNo, COL_TODO_DATE).Value = Date
+            wsDaily.Cells(rowNo, COL_ACTUAL_DATE).Value = Date
+            wsDaily.Cells(rowNo, COL_TODO_DATE).Resize(1, 2).NumberFormat = DATE_DISPLAY_FORMAT
+
+            statusText = Trim$(CStr(wsDaily.Cells(rowNo, DAILY_STATUS_COLUMN).Value))
+            If Len(statusText) = 0 Then
+                statusText = DAILY_STATUS_ON
+                wsDaily.Cells(rowNo, DAILY_STATUS_COLUMN).Value = statusText
+            End If
+
+            shouldAdd = (statusText <> DAILY_STATUS_OFF)
+
+            If IsDate(wsDaily.Cells(rowNo, DAILY_LAST_DATE_COLUMN).Value) Then
+                If DateValue(wsDaily.Cells(rowNo, DAILY_LAST_DATE_COLUMN).Value) = Date Then
+                    shouldAdd = False
+                End If
+            End If
+
+            If shouldAdd Then
+                targetRow = 次のデータ行(wsTodo)
+                行の書式を整える wsTodo, targetRow
+
+                wsTodo.Cells(targetRow, COL_TODO_DATE).Value = Date
+                wsTodo.Cells(targetRow, COL_ACTUAL_DATE).Value = Date
+                wsTodo.Cells(targetRow, COL_NO).Value = wsDaily.Cells(rowNo, COL_NO).Value
+                wsTodo.Cells(targetRow, COL_TASK).Value = wsDaily.Cells(rowNo, COL_TASK).Value
+                wsTodo.Cells(targetRow, COL_CHECK).ClearContents
+
+                wsDaily.Cells(rowNo, DAILY_LAST_DATE_COLUMN).Value = Date
+                wsDaily.Cells(rowNo, DAILY_LAST_DATE_COLUMN).NumberFormat = DATE_DISPLAY_FORMAT
+                毎日業務を追加する = 毎日業務を追加する + 1
+            End If
+        End If
+    Next rowNo
+End Function
+
+Private Function シートを用意(ByVal targetName As String) As Worksheet
+    Dim ws As Worksheet
+    Dim resultSheet As Worksheet
+
+    On Error Resume Next
+    Set resultSheet = ThisWorkbook.Worksheets(targetName)
+    On Error GoTo 0
+
+    If Not resultSheet Is Nothing Then
+        Set シートを用意 = resultSheet
+        Exit Function
+    End If
+
+    ' 新しい空ブックなら、最初からある空シートをそのまま使う
+    For Each ws In ThisWorkbook.Worksheets
+        If Not ToDo用の名前か(ws.Name) Then
+            If シートが空(ws) Then
+                ws.Name = targetName
+                Set シートを用意 = ws
+                Exit Function
+            End If
+        End If
+    Next ws
+
+    ' 空きシートがなければ足す
+    Set resultSheet = ThisWorkbook.Worksheets.Add( _
+        After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count) _
+    )
+    resultSheet.Name = targetName
+    Set シートを用意 = resultSheet
+End Function
+
+Private Function シートが空(ByVal ws As Worksheet) As Boolean
+    シートが空 = _
+        (Application.WorksheetFunction.CountA(ws.UsedRange) = 0) And _
+        (ws.Shapes.Count = 0)
+End Function
+
+Private Function ToDo用の名前か(ByVal sheetName As String) As Boolean
+    ToDo用の名前か = _
+        (sheetName = INPUT_SHEET_NAME) Or _
+        (sheetName = TODO_SHEET_NAME) Or _
+        (sheetName = DONE_SHEET_NAME) Or _
+        (sheetName = DAILY_SHEET_NAME)
+End Function
+
+Private Function 必要なシートがある() As Boolean
+    Dim ws As Worksheet
+    Dim foundCount As Long
+
+    For Each ws In ThisWorkbook.Worksheets
+        If ToDo用の名前か(ws.Name) Then foundCount = foundCount + 1
+    Next ws
+
+    必要なシートがある = (foundCount = 4)
+End Function
+
+Private Sub 入力シートの体裁を作る(ByVal ws As Worksheet)
+    シートの基本設定 ws
+
+    ws.Tab.Color = RGB(22, 125, 127)
+    ws.Columns("A").ColumnWidth = 2.5
+    ws.Columns("B").ColumnWidth = 15
+    ws.Columns("C").ColumnWidth = 15
+    ws.Columns("D").ColumnWidth = 10
+    ws.Columns("E").ColumnWidth = 40
+    ws.Columns("F").ColumnWidth = 3
+    ws.Columns("G:H").ColumnWidth = 13
+
+    ws.Range("B1:H1").UnMerge
+    ws.Range("B1:H1").Merge
+    With ws.Range("B1:H1")
+        .Value = "ToDoを追加"
+        .Interior.Color = RGB(23, 50, 77)
+        .Font.Name = "Yu Gothic"
+        .Font.Size = 18
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .HorizontalAlignment = xlLeft
+        .VerticalAlignment = xlVAlignCenter
+    End With
+    ws.Rows(1).RowHeight = 34
+
+    ws.Cells(2, 2).Value = "ToDo納期"
+    ws.Cells(2, 3).Value = "実納期"
+    ws.Cells(2, 4).Value = "No"
+    ws.Cells(2, 5).Value = "行うこと"
+    見出しの書式 ws.Range("B2:E2")
+
+    With ws.Range("B3:E3")
+        .Interior.Color = RGB(255, 244, 220)
+        .Font.Name = "Yu Gothic"
+        .Font.Size = 11
+        .Font.Color = RGB(36, 55, 70)
+        .VerticalAlignment = xlVAlignCenter
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(244, 184, 96)
+        .Borders.Weight = xlThin
+    End With
+    ws.Rows(3).RowHeight = 34
+    ws.Range("B3:C3").NumberFormat = DATE_DISPLAY_FORMAT
+    ws.Range("D3").HorizontalAlignment = xlHAlignCenter
+    ws.Range("E3").WrapText = True
+
+    ws.Range("G2:H3").UnMerge
+    ws.Range("G2:H3").Merge
+    With ws.Range("G2:H3")
+        .Value = "追加"
+        .Interior.Color = RGB(22, 125, 127)
+        .Font.Name = "Yu Gothic"
+        .Font.Size = 12
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .HorizontalAlignment = xlHAlignCenter
+        .VerticalAlignment = xlVAlignCenter
+    End With
+
+    ws.Range("B5:H5").UnMerge
+    ws.Range("B5:H5").Merge
+    With ws.Range("B5:H5")
+        .Value = "入力のしかた"
+        .Interior.Color = RGB(234, 242, 248)
+        .Font.Name = "Yu Gothic"
+        .Font.Size = 11
+        .Font.Bold = True
+        .Font.Color = RGB(23, 50, 77)
+        .VerticalAlignment = xlVAlignCenter
+    End With
+
+    ws.Range("B6:H8").UnMerge
+    ws.Range("B6:H8").Merge
+    With ws.Range("B6:H8")
+        .Value = "納期はプルダウンから選ぶ。Noは空欄でもOK。" & vbLf & _
+                 "「行うこと」を入力して追加すると、ToDoリストへ移動して納期順に並ぶ。"
+        .Interior.Color = RGB(255, 255, 255)
+        .Font.Name = "Yu Gothic"
+        .Font.Size = 10
+        .Font.Color = RGB(102, 120, 133)
+        .WrapText = True
+        .VerticalAlignment = xlVAlignCenter
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(215, 224, 229)
+        .Borders.Weight = xlThin
+    End With
+
+    ws.Columns(DATE_LIST_COLUMN).Hidden = True
+End Sub
+
+Private Sub 一覧シートの体裁を作る(ByVal ws As Worksheet, ByVal isDone As Boolean)
+    Dim lastFormatRow As Long
+
+    シートの基本設定 ws
+
+    If isDone Then
+        ws.Tab.Color = RGB(92, 158, 114)
+    Else
+        ws.Tab.Color = RGB(23, 50, 77)
+    End If
+
+    ws.Columns("A").ColumnWidth = 2.5
+    ws.Columns("B").ColumnWidth = 15
+    ws.Columns("C").ColumnWidth = 15
+    ws.Columns("D").ColumnWidth = 10
+    ws.Columns("E").ColumnWidth = 42
+    ws.Columns("F").ColumnWidth = 11
+    ws.Columns("G").ColumnWidth = 3
+    ws.Columns("H:I").ColumnWidth = 13
+
+    ws.Range("B1:I1").UnMerge
+    ws.Range("B1:I1").Merge
+    With ws.Range("B1:I1")
+        If isDone Then
+            .Value = "完了済み"
+        Else
+            .Value = "ToDoリスト"
+        End If
+        .Interior.Color = RGB(23, 50, 77)
+        .Font.Name = "Yu Gothic"
+        .Font.Size = 18
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .HorizontalAlignment = xlLeft
+        .VerticalAlignment = xlVAlignCenter
+    End With
+    ws.Rows(1).RowHeight = 34
+
+    ws.Cells(2, 2).Value = "ToDo納期"
+    ws.Cells(2, 3).Value = "実納期"
+    ws.Cells(2, 4).Value = "No"
+    ws.Cells(2, 5).Value = "行うこと"
+    ws.Cells(2, 6).Value = "チェック"
+    見出しの書式 ws.Range("B2:F2")
+
+    lastFormatRow = 最終データ行(ws)
+    If lastFormatRow < 42 Then lastFormatRow = 42
+
+    With ws.Range(ws.Cells(FIRST_DATA_ROW, COL_TODO_DATE), ws.Cells(lastFormatRow, COL_CHECK))
+        .Interior.Color = RGB(255, 255, 255)
+        .Font.Name = "Yu Gothic"
+        .Font.Size = 10
+        .Font.Color = RGB(36, 55, 70)
+        .VerticalAlignment = xlVAlignCenter
+        .Borders(xlInsideHorizontal).LineStyle = xlContinuous
+        .Borders(xlInsideHorizontal).Color = RGB(215, 224, 229)
+        .Borders(xlInsideHorizontal).Weight = xlThin
+    End With
+
+    ws.Range(ws.Cells(FIRST_DATA_ROW, COL_TODO_DATE), ws.Cells(lastFormatRow, COL_ACTUAL_DATE)).NumberFormat = DATE_DISPLAY_FORMAT
+    ws.Range(ws.Cells(FIRST_DATA_ROW, COL_TODO_DATE), ws.Cells(lastFormatRow, COL_NO)).HorizontalAlignment = xlHAlignCenter
+    ws.Range(ws.Cells(FIRST_DATA_ROW, COL_TASK), ws.Cells(lastFormatRow, COL_TASK)).WrapText = True
+    ws.Range(ws.Cells(FIRST_DATA_ROW, COL_CHECK), ws.Cells(lastFormatRow, COL_CHECK)).HorizontalAlignment = xlHAlignCenter
+    ws.Rows(FIRST_DATA_ROW & ":" & lastFormatRow).RowHeight = 24
+
+    期限色を設定 ws
+
+    If isDone Then
+        完了シートの右側を作る ws
+    Else
+        ToDoシートの右側を作る ws
+    End If
+End Sub
+
+Private Sub 毎日業務シートの体裁を作る(ByVal ws As Worksheet)
+    Dim lastFormatRow As Long
+    Dim statusRange As Range
+
+    シートの基本設定 ws
+
+    ws.Tab.Color = RGB(244, 184, 96)
+    ws.Columns("A").ColumnWidth = 2.5
+    ws.Columns("B").ColumnWidth = 15
+    ws.Columns("C").ColumnWidth = 15
+    ws.Columns("D").ColumnWidth = 10
+    ws.Columns("E").ColumnWidth = 38
+    ws.Columns("F").ColumnWidth = 11
+    ws.Columns("G").ColumnWidth = 15
+    ws.Columns("H").ColumnWidth = 3
+    ws.Columns("I:J").ColumnWidth = 14
+
+    ws.Range("B1:J1").UnMerge
+    ws.Range("B1:J1").Merge
+    With ws.Range("B1:J1")
+        .Value = "毎日行う業務"
+        .Interior.Color = RGB(23, 50, 77)
+        .Font.Name = "Yu Gothic"
+        .Font.Size = 18
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .HorizontalAlignment = xlLeft
+        .VerticalAlignment = xlVAlignCenter
+    End With
+    ws.Rows(1).RowHeight = 34
+
+    ws.Cells(2, 2).Value = "ToDo納期"
+    ws.Cells(2, 3).Value = "実納期"
+    ws.Cells(2, 4).Value = "No"
+    ws.Cells(2, 5).Value = "行うこと"
+    ws.Cells(2, 6).Value = "状態"
+    ws.Cells(2, 7).Value = "最終追加日"
+    見出しの書式 ws.Range("B2:G2")
+
+    lastFormatRow = ws.Cells(ws.Rows.Count, COL_TASK).End(xlUp).Row
+    If lastFormatRow < 42 Then lastFormatRow = 42
+
+    With ws.Range(ws.Cells(FIRST_DATA_ROW, COL_TODO_DATE), ws.Cells(lastFormatRow, DAILY_LAST_DATE_COLUMN))
+        .Interior.Color = RGB(255, 255, 255)
+        .Font.Name = "Yu Gothic"
+        .Font.Size = 10
+        .Font.Color = RGB(36, 55, 70)
+        .VerticalAlignment = xlVAlignCenter
+        .Borders(xlInsideHorizontal).LineStyle = xlContinuous
+        .Borders(xlInsideHorizontal).Color = RGB(215, 224, 229)
+        .Borders(xlInsideHorizontal).Weight = xlThin
+    End With
+
+    With ws.Range(ws.Cells(FIRST_DATA_ROW, COL_TODO_DATE), ws.Cells(lastFormatRow, COL_ACTUAL_DATE))
+        .Interior.Color = RGB(234, 242, 248)
+        .NumberFormat = DATE_DISPLAY_FORMAT
+        .HorizontalAlignment = xlHAlignCenter
+    End With
+
+    With ws.Range(ws.Cells(FIRST_DATA_ROW, COL_NO), ws.Cells(lastFormatRow, COL_TASK))
+        .Interior.Color = RGB(255, 244, 220)
+    End With
+
+    ws.Range(ws.Cells(FIRST_DATA_ROW, COL_NO), ws.Cells(lastFormatRow, COL_NO)).HorizontalAlignment = xlHAlignCenter
+    ws.Range(ws.Cells(FIRST_DATA_ROW, COL_TASK), ws.Cells(lastFormatRow, COL_TASK)).WrapText = True
+    ws.Range(ws.Cells(FIRST_DATA_ROW, DAILY_STATUS_COLUMN), ws.Cells(lastFormatRow, DAILY_STATUS_COLUMN)).HorizontalAlignment = xlHAlignCenter
+
+    With ws.Range(ws.Cells(FIRST_DATA_ROW, DAILY_LAST_DATE_COLUMN), ws.Cells(lastFormatRow, DAILY_LAST_DATE_COLUMN))
+        .Interior.Color = RGB(234, 247, 243)
+        .NumberFormat = DATE_DISPLAY_FORMAT
+        .HorizontalAlignment = xlHAlignCenter
+    End With
+
+    ws.Rows(FIRST_DATA_ROW & ":" & lastFormatRow).RowHeight = 24
+
+    Set statusRange = ws.Range("F3:F1000")
+    With statusRange.Validation
+        .Delete
+        .Add Type:=xlValidateList, _
+             AlertStyle:=xlValidAlertStop, _
+             Operator:=xlBetween, _
+             Formula1:=DAILY_STATUS_ON & _
+                 Application.International(xlListSeparator) & _
+                 DAILY_STATUS_OFF
+        .IgnoreBlank = True
+        .InCellDropdown = True
+        .ErrorTitle = "状態を確認"
+        .ErrorMessage = "「有効」か「停止」を選んで。"
+        .ShowError = True
+    End With
+
+    ws.Range("I2:J3").UnMerge
+    ws.Range("I2:J3").Merge
+    With ws.Range("I2:J3")
+        .Value = "本日分を追加"
+        .Interior.Color = RGB(22, 125, 127)
+        .Font.Size = 11
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .HorizontalAlignment = xlHAlignCenter
+        .VerticalAlignment = xlVAlignCenter
+    End With
+
+    ws.Range("I5:J10").UnMerge
+    ws.Range("I5:J10").Merge
+    With ws.Range("I5:J10")
+        .Value = "D列のNoは空欄でもOK。" & vbLf & _
+                 "E列に毎日行う内容を書く。" & vbLf & _
+                 "止めたい行だけF列を「停止」にする。" & vbLf & _
+                 "B・C・G列は自動で入る。"
+        .Interior.Color = RGB(234, 247, 243)
+        .Font.Color = RGB(92, 120, 102)
+        .WrapText = True
+        .HorizontalAlignment = xlHAlignCenter
+        .VerticalAlignment = xlVAlignCenter
+    End With
+End Sub
+
+Private Sub シートの基本設定(ByVal ws As Worksheet)
+    ws.Activate
+    ActiveWindow.DisplayGridlines = False
+
+    With ws.Range("A1:J60")
+        .Interior.Color = RGB(245, 248, 250)
+        .Font.Name = "Yu Gothic"
+        .Font.Size = 10
+        .Font.Color = RGB(36, 55, 70)
+    End With
+End Sub
+
+Private Sub 見出しの書式(ByVal targetRange As Range)
+    With targetRange
+        .Interior.Color = RGB(22, 125, 127)
+        .Font.Name = "Yu Gothic"
+        .Font.Size = 10
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .HorizontalAlignment = xlHAlignCenter
+        .VerticalAlignment = xlVAlignCenter
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(22, 125, 127)
+        .Borders.Weight = xlThin
+    End With
+    targetRange.Rows.RowHeight = 26
+End Sub
+
+Private Sub ToDoシートの右側を作る(ByVal ws As Worksheet)
+    ws.Range("H2:I2").UnMerge
+    ws.Range("H2:I2").Merge
+    With ws.Range("H2:I2")
+        .Value = "未完了の件数"
+        .Interior.Color = RGB(234, 242, 248)
+        .Font.Bold = True
+        .Font.Color = RGB(23, 50, 77)
+        .HorizontalAlignment = xlHAlignCenter
+    End With
+
+    ws.Range("H3:I4").UnMerge
+    ws.Range("H3:I4").Merge
+    With ws.Range("H3:I4")
+        .Formula = "=MAX(0,COUNTA(B:B)-2)"
+        .Interior.Color = RGB(255, 255, 255)
+        .Font.Size = 20
+        .Font.Bold = True
+        .Font.Color = RGB(22, 125, 127)
+        .HorizontalAlignment = xlHAlignCenter
+        .VerticalAlignment = xlVAlignCenter
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(215, 224, 229)
+        .Borders.Weight = xlThin
+    End With
+
+    ws.Range("H6:I8").UnMerge
+    ws.Range("H6:I8").Merge
+    With ws.Range("H6:I8")
+        .Value = "チェックをクリックすると" & vbLf & "完了済みに移動する。"
+        .Interior.Color = RGB(234, 247, 243)
+        .Font.Color = RGB(92, 158, 114)
+        .WrapText = True
+        .HorizontalAlignment = xlHAlignCenter
+        .VerticalAlignment = xlVAlignCenter
+    End With
+End Sub
+
+Private Sub 完了シートの右側を作る(ByVal ws As Worksheet)
+    ws.Range("H2:I3").UnMerge
+    ws.Range("H2:I3").Merge
+    With ws.Range("H2:I3")
+        .Value = "昨日以前を削除"
+        .Interior.Color = RGB(217, 93, 93)
+        .Font.Size = 11
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .HorizontalAlignment = xlHAlignCenter
+        .VerticalAlignment = xlVAlignCenter
+    End With
+
+    ws.Range("H5:I5").UnMerge
+    ws.Range("H5:I5").Merge
+    With ws.Range("H5:I5")
+        .Value = "完了の件数"
+        .Interior.Color = RGB(233, 244, 236)
+        .Font.Bold = True
+        .Font.Color = RGB(92, 158, 114)
+        .HorizontalAlignment = xlHAlignCenter
+    End With
+
+    ws.Range("H6:I7").UnMerge
+    ws.Range("H6:I7").Merge
+    With ws.Range("H6:I7")
+        .Formula = "=MAX(0,COUNTA(B:B)-2)"
+        .Interior.Color = RGB(255, 255, 255)
+        .Font.Size = 20
+        .Font.Bold = True
+        .Font.Color = RGB(92, 158, 114)
+        .HorizontalAlignment = xlHAlignCenter
+        .VerticalAlignment = xlVAlignCenter
+        .Borders.LineStyle = xlContinuous
+        .Borders.Color = RGB(215, 224, 229)
+        .Borders.Weight = xlThin
+    End With
+
+    ws.Range("H9:I11").UnMerge
+    ws.Range("H9:I11").Merge
+    With ws.Range("H9:I11")
+        .Value = "チェックを外すと" & vbLf & "ToDoリストに戻る。"
+        .Interior.Color = RGB(234, 242, 248)
+        .Font.Color = RGB(23, 50, 77)
+        .WrapText = True
+        .HorizontalAlignment = xlHAlignCenter
+        .VerticalAlignment = xlVAlignCenter
+    End With
+End Sub
+
+Private Sub 期限色を設定(ByVal ws As Worksheet)
+    Dim targetRange As Range
+    Dim rule As FormatCondition
+
+    Set targetRange = ws.Range("B3:B1000")
+    targetRange.FormatConditions.Delete
+
+    Set rule = targetRange.FormatConditions.Add( _
+        Type:=xlExpression, _
+        Formula1:="=AND(B3<>"""",B3<TODAY())" _
+    )
+    rule.Interior.Color = RGB(253, 233, 231)
+    rule.Font.Color = RGB(163, 59, 59)
+    rule.Font.Bold = True
+
+    Set rule = targetRange.FormatConditions.Add( _
+        Type:=xlExpression, _
+        Formula1:="=AND(B3<>"""",B3=TODAY())" _
+    )
+    rule.Interior.Color = RGB(255, 244, 220)
+    rule.Font.Color = RGB(138, 90, 19)
+    rule.Font.Bold = True
+End Sub
+
+Private Sub 追加ボタンを作る()
+    Dim ws As Worksheet
+
+    Set ws = ThisWorkbook.Worksheets(INPUT_SHEET_NAME)
+    ボタンを作る ws, ADD_BUTTON_NAME, ws.Range("G2:H3"), _
+                "追加", "Todoを追加", RGB(22, 125, 127)
+End Sub
+
+Private Sub 削除ボタンを作る()
+    Dim ws As Worksheet
+
+    Set ws = ThisWorkbook.Worksheets(DONE_SHEET_NAME)
+    ボタンを作る ws, DELETE_BUTTON_NAME, ws.Range("H2:I3"), _
+                "昨日以前を削除", "期限切れ完了行を削除", RGB(217, 93, 93)
+End Sub
+
+Private Sub 毎日業務ボタンを作る()
+    Dim ws As Worksheet
+
+    Set ws = ThisWorkbook.Worksheets(DAILY_SHEET_NAME)
+    ボタンを作る ws, DAILY_BUTTON_NAME, ws.Range("I2:J3"), _
+                "本日分を追加", "毎日業務を本日分へ追加", RGB(22, 125, 127)
+End Sub
+
+Private Sub ボタンを作る( _
+    ByVal ws As Worksheet, _
+    ByVal shapeName As String, _
+    ByVal targetRange As Range, _
+    ByVal caption As String, _
+    ByVal macroName As String, _
+    ByVal fillColor As Long _
+)
+    Dim buttonShape As Shape
+
+    On Error Resume Next
+    ws.Shapes(shapeName).Delete
+    On Error GoTo 0
+
+    Set buttonShape = ws.Shapes.AddShape( _
+        msoShapeRoundedRectangle, _
+        targetRange.Left, _
+        targetRange.Top, _
+        targetRange.Width, _
+        targetRange.Height _
+    )
+
+    With buttonShape
+        .Name = shapeName
+        .OnAction = マクロ名を作る(macroName)
+        .Placement = xlMoveAndSize
+        .Fill.ForeColor.RGB = fillColor
+        .Line.Visible = msoFalse
+        .TextFrame.Characters.Text = caption
+        .TextFrame.HorizontalAlignment = xlHAlignCenter
+        .TextFrame.VerticalAlignment = xlVAlignCenter
+        .TextFrame.Characters.Font.Name = "Yu Gothic"
+        .TextFrame.Characters.Font.Size = 11
+        .TextFrame.Characters.Font.Bold = True
+        .TextFrame.Characters.Font.Color = RGB(255, 255, 255)
+    End With
+End Sub
+
+Private Function 次のデータ行(ByVal ws As Worksheet) As Long
+    Dim lastRow As Long
+
+    lastRow = 最終データ行(ws)
+
+    If lastRow < FIRST_DATA_ROW Then
+        次のデータ行 = FIRST_DATA_ROW
+    Else
+        次のデータ行 = lastRow + 1
+    End If
+End Function
+
+Private Function 最終データ行(ByVal ws As Worksheet) As Long
+    Dim foundCell As Range
+
+    Set foundCell = ws.Range( _
+        ws.Cells(FIRST_DATA_ROW, COL_TODO_DATE), _
+        ws.Cells(ws.Rows.Count, COL_TASK) _
+    ).Find( _
+        What:="*", _
+        After:=ws.Cells(FIRST_DATA_ROW, COL_TODO_DATE), _
+        LookIn:=xlFormulas, _
+        LookAt:=xlPart, _
+        SearchOrder:=xlByRows, _
+        SearchDirection:=xlPrevious, _
+        MatchCase:=False _
+    )
+
+    If foundCell Is Nothing Then
+        最終データ行 = FIRST_DATA_ROW - 1
+    Else
+        最終データ行 = foundCell.Row
+    End If
+End Function
+
+Private Function 行にデータがある(ByVal ws As Worksheet, ByVal rowNo As Long) As Boolean
+    行にデータがある = _
+        Application.WorksheetFunction.CountA( _
+            ws.Cells(rowNo, COL_TODO_DATE).Resize(1, 4) _
+        ) > 0
+End Function
+
+Private Sub 行の書式を整える(ByVal ws As Worksheet, ByVal rowNo As Long)
+    With ws.Cells(rowNo, COL_TODO_DATE).Resize(1, 5)
+        .Font.Name = "Yu Gothic"
+        .Font.Size = 10
+        .Interior.Color = RGB(255, 255, 255)
+        .VerticalAlignment = xlVAlignCenter
+        .Borders(xlEdgeBottom).LineStyle = xlContinuous
+        .Borders(xlEdgeBottom).Color = RGB(215, 224, 229)
+        .Borders(xlEdgeBottom).Weight = xlThin
+    End With
+
+    ws.Cells(rowNo, COL_TODO_DATE).Resize(1, 2).NumberFormat = DATE_DISPLAY_FORMAT
+    ws.Cells(rowNo, COL_TODO_DATE).Resize(1, 3).HorizontalAlignment = xlHAlignCenter
+    ws.Cells(rowNo, COL_TASK).WrapText = True
+    ws.Cells(rowNo, COL_CHECK).HorizontalAlignment = xlHAlignCenter
+
+    ws.Rows(rowNo).AutoFit
+    If ws.Rows(rowNo).RowHeight < 24 Then ws.Rows(rowNo).RowHeight = 24
+End Sub
+
+Private Function マクロ名を作る(ByVal procedureName As String) As String
+    マクロ名を作る = "'" & Replace(ThisWorkbook.Name, "'", "''") & "'!" & procedureName
+End Function
