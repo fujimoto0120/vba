@@ -1,35 +1,46 @@
 Option Explicit
 
-' 変えそうなところはここ
+' シート名を変える場合は、まずここを直す。
 Private Const INPUT_SHEET_NAME As String = "todo追加"
 Private Const TODO_SHEET_NAME As String = "ToDoリスト"
 Private Const DONE_SHEET_NAME As String = "完了済み"
 Private Const DAILY_SHEET_NAME As String = "毎日行う業務"
 
+' 表の位置を変える場合に使う。
 Private Const HEADER_ROW As Long = 2
 Private Const FIRST_DATA_ROW As Long = 3
 Private Const INPUT_ROW As Long = 3
 
+' B列からF列までをToDoデータとして扱う。
 Private Const COL_TODO_DATE As Long = 2
 Private Const COL_ACTUAL_DATE As Long = 3
 Private Const COL_NO As Long = 4
 Private Const COL_TASK As Long = 5
 Private Const COL_CHECK As Long = 6
 
+' 日付候補は入力シートのX列に置き、普段は列ごと非表示にする。
 Private Const DATE_LIST_COLUMN As Long = 24
 Private Const DATE_LIST_FIRST_ROW As Long = 2
+Private Const DATE_LIST_CLEAR_ROW_COUNT As Long = 41
+
 Private Const DAILY_STATUS_COLUMN As Long = 6
 Private Const DAILY_LAST_DATE_COLUMN As Long = 7
 Private Const DAILY_STATUS_ON As String = "有効"
 Private Const DAILY_STATUS_OFF As String = "停止"
+
 Private Const CHECKBOX_PREFIX As String = "todoCheck_"
 Private Const ADD_BUTTON_NAME As String = "todoAddButton"
 Private Const DELETE_BUTTON_NAME As String = "oldDoneDeleteButton"
 Private Const DAILY_BUTTON_NAME As String = "dailyTodoAddButton"
+
 Private Const DATE_DISPLAY_FORMAT As String = "yyyy/mm/dd"
 Private Const DELETE_DATE_COLUMN As Long = 2
+Private Const MIN_FORMAT_LAST_ROW As Long = 42
+Private Const DATA_ENTRY_LAST_ROW As Long = 1000
+Private Const CHECKBOX_SIZE As Double = 14
 
 Public Sub Auto_Open()
+    ' マクロを有効にしてブックを開いたときだけ、自動で初期設定を行う。
     初期設定
 End Sub
 
@@ -38,13 +49,16 @@ Public Sub 初期設定()
     Dim wsTodo As Worksheet
     Dim wsDone As Worksheet
     Dim wsDaily As Worksheet
-    Dim dailyAddCount As Long
+    Dim previousScreenUpdating As Boolean
+    Dim previousEnableEvents As Boolean
+    Dim excelStateChanged As Boolean
 
     On Error GoTo ErrHandler
 
-    Application.ScreenUpdating = False
-    Application.EnableEvents = False
+    Excelの状態を保存して処理を始める previousScreenUpdating, previousEnableEvents
+    excelStateChanged = True
 
+    ' 足りないシートを用意したあと、使う順番に並べる。
     Set wsInput = シートを用意(INPUT_SHEET_NAME)
     Set wsTodo = シートを用意(TODO_SHEET_NAME)
     Set wsDone = シートを用意(DONE_SHEET_NAME)
@@ -67,7 +81,8 @@ Public Sub 初期設定()
 
     チェック欄を削除 wsTodo
     チェック欄を削除 wsDone
-    dailyAddCount = 毎日業務を追加する
+    ' 同じ日には重複追加されないため、初期設定のたびに呼んでも問題ない。
+    毎日業務を追加する
     納期順に並び替える wsTodo
     納期順に並び替える wsDone
     チェック欄を作り直す wsTodo
@@ -78,8 +93,9 @@ Public Sub 初期設定()
     wsInput.Cells(INPUT_ROW, COL_TODO_DATE).Select
 
 ExitPoint:
-    Application.EnableEvents = True
-    Application.ScreenUpdating = True
+    If excelStateChanged Then
+        Excelの状態を戻す previousScreenUpdating, previousEnableEvents
+    End If
     Exit Sub
 
 ErrHandler:
@@ -91,6 +107,9 @@ Public Sub Todoを追加()
     Dim wsInput As Worksheet
     Dim wsTodo As Worksheet
     Dim nextRow As Long
+    Dim previousScreenUpdating As Boolean
+    Dim previousEnableEvents As Boolean
+    Dim excelStateChanged As Boolean
 
     On Error GoTo ErrHandler
 
@@ -124,18 +143,21 @@ Public Sub Todoを追加()
         Exit Sub
     End If
 
-    Application.ScreenUpdating = False
-    Application.EnableEvents = False
+    Excelの状態を保存して処理を始める previousScreenUpdating, previousEnableEvents
+    excelStateChanged = True
 
+    ' 並び替えで位置が変わるため、チェックボックスはいったん消して最後に作り直す。
     チェック欄を削除 wsTodo
 
     nextRow = 次のデータ行(wsTodo)
     行の書式を整える wsTodo, nextRow
 
+    ' 入力欄のB～E列を値として一覧へ移す。
     wsTodo.Cells(nextRow, COL_TODO_DATE).Resize(1, 4).Value = _
         wsInput.Cells(INPUT_ROW, COL_TODO_DATE).Resize(1, 4).Value
     wsTodo.Cells(nextRow, COL_CHECK).ClearContents
 
+    ' 転記が終わってから入力欄を空にする。
     wsInput.Cells(INPUT_ROW, COL_TODO_DATE).Resize(1, 4).ClearContents
 
     納期順に並び替える wsTodo
@@ -147,8 +169,9 @@ Public Sub Todoを追加()
     MsgBox "ToDoリストに追加した。", vbInformation
 
 ExitPoint:
-    Application.EnableEvents = True
-    Application.ScreenUpdating = True
+    If excelStateChanged Then
+        Excelの状態を戻す previousScreenUpdating, previousEnableEvents
+    End If
     Exit Sub
 
 ErrHandler:
@@ -159,6 +182,9 @@ End Sub
 Public Sub 毎日業務を本日分へ追加()
     Dim wsTodo As Worksheet
     Dim addCount As Long
+    Dim previousScreenUpdating As Boolean
+    Dim previousEnableEvents As Boolean
+    Dim excelStateChanged As Boolean
 
     On Error GoTo ErrHandler
 
@@ -169,8 +195,8 @@ Public Sub 毎日業務を本日分へ追加()
 
     Set wsTodo = ThisWorkbook.Worksheets(TODO_SHEET_NAME)
 
-    Application.ScreenUpdating = False
-    Application.EnableEvents = False
+    Excelの状態を保存して処理を始める previousScreenUpdating, previousEnableEvents
+    excelStateChanged = True
 
     チェック欄を削除 wsTodo
     addCount = 毎日業務を追加する
@@ -181,8 +207,9 @@ Public Sub 毎日業務を本日分へ追加()
     MsgBox addCount & "件を本日分として追加した。", vbInformation
 
 ExitPoint:
-    Application.EnableEvents = True
-    Application.ScreenUpdating = True
+    If excelStateChanged Then
+        Excelの状態を戻す previousScreenUpdating, previousEnableEvents
+    End If
     Exit Sub
 
 ErrHandler:
@@ -196,6 +223,11 @@ Public Sub 期限切れ完了行を削除()
     Dim rowNo As Long
     Dim deleteCount As Long
     Dim answer As VbMsgBoxResult
+    Dim previousScreenUpdating As Boolean
+    Dim previousEnableEvents As Boolean
+    Dim excelStateChanged As Boolean
+
+    On Error GoTo ErrHandler
 
     If Not 必要なシートがある Then
         MsgBox "先に「初期設定」を実行して。", vbExclamation
@@ -219,13 +251,13 @@ Public Sub 期限切れ完了行を削除()
 
     If answer <> vbYes Then Exit Sub
 
-    On Error GoTo ErrHandler
-
-    Application.ScreenUpdating = False
-    Application.EnableEvents = False
+    Excelの状態を保存して処理を始める previousScreenUpdating, previousEnableEvents
+    excelStateChanged = True
 
     チェック欄を削除 ws
 
+    ' 下から削除すると、上の行番号が途中でずれない。
+    ' B～F列だけを詰め、右側にある集計表示やボタンは残す。
     For rowNo = lastRow To FIRST_DATA_ROW Step -1
         If IsDate(ws.Cells(rowNo, DELETE_DATE_COLUMN).Value) Then
             If DateValue(ws.Cells(rowNo, DELETE_DATE_COLUMN).Value) < Date Then
@@ -242,8 +274,9 @@ Public Sub 期限切れ完了行を削除()
     MsgBox deleteCount & "件削除した。", vbInformation
 
 ExitPoint:
-    Application.EnableEvents = True
-    Application.ScreenUpdating = True
+    If excelStateChanged Then
+        Excelの状態を戻す previousScreenUpdating, previousEnableEvents
+    End If
     Exit Sub
 
 ErrHandler:
@@ -258,9 +291,13 @@ Public Sub チェック切替()
     Dim sourceRow As Long
     Dim targetRow As Long
     Dim callerName As String
+    Dim previousScreenUpdating As Boolean
+    Dim previousEnableEvents As Boolean
+    Dim excelStateChanged As Boolean
 
     On Error GoTo ErrHandler
 
+    ' 押されたチェックボックスの名前から対象行を調べる。
     callerName = CStr(Application.Caller)
     Set sourceSheet = ActiveSheet
     Set clickedShape = sourceSheet.Shapes(callerName)
@@ -277,8 +314,8 @@ Public Sub チェック切替()
         Exit Sub
     End If
 
-    Application.ScreenUpdating = False
-    Application.EnableEvents = False
+    Excelの状態を保存して処理を始める previousScreenUpdating, previousEnableEvents
+    excelStateChanged = True
 
     チェック欄を削除 sourceSheet
     チェック欄を削除 targetSheet
@@ -299,8 +336,9 @@ Public Sub チェック切替()
     集計を更新
 
 ExitPoint:
-    Application.EnableEvents = True
-    Application.ScreenUpdating = True
+    If excelStateChanged Then
+        Excelの状態を戻す previousScreenUpdating, previousEnableEvents
+    End If
     Exit Sub
 
 ErrHandler:
@@ -317,10 +355,11 @@ Public Sub 日付候補を更新()
 
     Set ws = ThisWorkbook.Worksheets(INPUT_SHEET_NAME)
 
+    ' 入力規則の参照先を更新するときだけ、日付候補の列を表示する。
     ws.Columns(DATE_LIST_COLUMN).Hidden = False
     ws.Range( _
         ws.Cells(DATE_LIST_FIRST_ROW, DATE_LIST_COLUMN), _
-        ws.Cells(DATE_LIST_FIRST_ROW + 40, DATE_LIST_COLUMN) _
+        ws.Cells(DATE_LIST_FIRST_ROW + DATE_LIST_CLEAR_ROW_COUNT - 1, DATE_LIST_COLUMN) _
     ).ClearContents
 
     d = Date
@@ -364,6 +403,7 @@ Public Sub 納期順に並び替える(ByVal ws As Worksheet)
     lastRow = 最終データ行(ws)
     If lastRow < FIRST_DATA_ROW Then Exit Sub
 
+    ' 見出し行を含めて指定し、データ部分だけを納期の昇順にする。
     ws.Range( _
         ws.Cells(HEADER_ROW, COL_TODO_DATE), _
         ws.Cells(lastRow, COL_CHECK) _
@@ -385,7 +425,6 @@ Public Sub チェック欄を作り直す(ByVal ws As Worksheet)
     Dim rowNo As Long
     Dim targetCell As Range
     Dim box As CheckBox
-    Dim boxSize As Double
     Dim isDoneSheet As Boolean
 
     チェック欄を削除 ws
@@ -394,7 +433,6 @@ Public Sub チェック欄を作り直す(ByVal ws As Worksheet)
     If lastRow < FIRST_DATA_ROW Then Exit Sub
 
     isDoneSheet = (ws.Name = DONE_SHEET_NAME)
-    boxSize = 14
 
     For rowNo = FIRST_DATA_ROW To lastRow
         If 行にデータがある(ws, rowNo) Then
@@ -402,10 +440,10 @@ Public Sub チェック欄を作り直す(ByVal ws As Worksheet)
             targetCell.ClearContents
 
             Set box = ws.CheckBoxes.Add( _
-                targetCell.Left + (targetCell.Width - boxSize) / 2, _
-                targetCell.Top + (targetCell.Height - boxSize) / 2, _
-                boxSize, _
-                boxSize _
+                targetCell.Left + (targetCell.Width - CHECKBOX_SIZE) / 2, _
+                targetCell.Top + (targetCell.Height - CHECKBOX_SIZE) / 2, _
+                CHECKBOX_SIZE, _
+                CHECKBOX_SIZE _
             )
 
             With box
@@ -475,6 +513,7 @@ Private Function 毎日業務を追加する() As Long
 
             shouldAdd = (statusText <> DAILY_STATUS_OFF)
 
+            ' 最終追加日を見て、同じ日に二重登録しないようにする。
             If IsDate(wsDaily.Cells(rowNo, DAILY_LAST_DATE_COLUMN).Value) Then
                 If DateValue(wsDaily.Cells(rowNo, DAILY_LAST_DATE_COLUMN).Value) = Date Then
                     shouldAdd = False
@@ -512,7 +551,8 @@ Private Function シートを用意(ByVal targetName As String) As Worksheet
         Exit Function
     End If
 
-    ' 新しい空ブックなら、最初からある空シートをそのまま使う
+    ' 新しい空ブックなら、最初からある空シートをそのまま使う。
+    ' 値と図形がないシートだけが対象なので、入力済みのシートは改名しない。
     For Each ws In ThisWorkbook.Worksheets
         If Not ToDo用の名前か(ws.Name) Then
             If シートが空(ws) Then
@@ -523,7 +563,7 @@ Private Function シートを用意(ByVal targetName As String) As Worksheet
         End If
     Next ws
 
-    ' 空きシートがなければ足す
+    ' 空きシートがなければ新しいシートを足す。
     Set resultSheet = ThisWorkbook.Worksheets.Add( _
         After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count) _
     )
@@ -693,7 +733,7 @@ Private Sub 一覧シートの体裁を作る(ByVal ws As Worksheet, ByVal isDon
     見出しの書式 ws.Range("B2:F2")
 
     lastFormatRow = 最終データ行(ws)
-    If lastFormatRow < 42 Then lastFormatRow = 42
+    If lastFormatRow < MIN_FORMAT_LAST_ROW Then lastFormatRow = MIN_FORMAT_LAST_ROW
 
     With ws.Range(ws.Cells(FIRST_DATA_ROW, COL_TODO_DATE), ws.Cells(lastFormatRow, COL_CHECK))
         .Interior.Color = RGB(255, 255, 255)
@@ -761,7 +801,7 @@ Private Sub 毎日業務シートの体裁を作る(ByVal ws As Worksheet)
     見出しの書式 ws.Range("B2:G2")
 
     lastFormatRow = ws.Cells(ws.Rows.Count, COL_TASK).End(xlUp).Row
-    If lastFormatRow < 42 Then lastFormatRow = 42
+    If lastFormatRow < MIN_FORMAT_LAST_ROW Then lastFormatRow = MIN_FORMAT_LAST_ROW
 
     With ws.Range(ws.Cells(FIRST_DATA_ROW, COL_TODO_DATE), ws.Cells(lastFormatRow, DAILY_LAST_DATE_COLUMN))
         .Interior.Color = RGB(255, 255, 255)
@@ -796,7 +836,10 @@ Private Sub 毎日業務シートの体裁を作る(ByVal ws As Worksheet)
 
     ws.Rows(FIRST_DATA_ROW & ":" & lastFormatRow).RowHeight = 24
 
-    Set statusRange = ws.Range("F3:F1000")
+    Set statusRange = ws.Range( _
+        ws.Cells(FIRST_DATA_ROW, DAILY_STATUS_COLUMN), _
+        ws.Cells(DATA_ENTRY_LAST_ROW, DAILY_STATUS_COLUMN) _
+    )
     With statusRange.Validation
         .Delete
         .Add Type:=xlValidateList, _
@@ -959,7 +1002,10 @@ Private Sub 期限色を設定(ByVal ws As Worksheet)
     Dim targetRange As Range
     Dim rule As FormatCondition
 
-    Set targetRange = ws.Range("B3:B1000")
+    Set targetRange = ws.Range( _
+        ws.Cells(FIRST_DATA_ROW, COL_TODO_DATE), _
+        ws.Cells(DATA_ENTRY_LAST_ROW, COL_TODO_DATE) _
+    )
     targetRange.FormatConditions.Delete
 
     Set rule = targetRange.FormatConditions.Add( _
@@ -1056,6 +1102,7 @@ End Function
 Private Function 最終データ行(ByVal ws As Worksheet) As Long
     Dim foundCell As Range
 
+    ' B～E列のどこかに値や数式がある最後の行を返す。
     Set foundCell = ws.Range( _
         ws.Cells(FIRST_DATA_ROW, COL_TODO_DATE), _
         ws.Cells(ws.Rows.Count, COL_TASK) _
@@ -1103,6 +1150,27 @@ Private Sub 行の書式を整える(ByVal ws As Worksheet, ByVal rowNo As Long)
     If ws.Rows(rowNo).RowHeight < 24 Then ws.Rows(rowNo).RowHeight = 24
 End Sub
 
+Private Sub Excelの状態を保存して処理を始める( _
+    ByRef previousScreenUpdating As Boolean, _
+    ByRef previousEnableEvents As Boolean _
+)
+    ' 呼び出し前の状態を覚えておき、処理後に勝手に設定を変えないようにする。
+    previousScreenUpdating = Application.ScreenUpdating
+    previousEnableEvents = Application.EnableEvents
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+End Sub
+
+Private Sub Excelの状態を戻す( _
+    ByVal previousScreenUpdating As Boolean, _
+    ByVal previousEnableEvents As Boolean _
+)
+    Application.EnableEvents = previousEnableEvents
+    Application.ScreenUpdating = previousScreenUpdating
+End Sub
+
 Private Function マクロ名を作る(ByVal procedureName As String) As String
+    ' ブック名にアポストロフィが含まれていても、OnActionで正しく呼べる形にする。
     マクロ名を作る = "'" & Replace(ThisWorkbook.Name, "'", "''") & "'!" & procedureName
 End Function
