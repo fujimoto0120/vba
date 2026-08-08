@@ -1,0 +1,568 @@
+Option Explicit
+
+Public Sub 選択見出しでグループ集計()
+
+    Dim keyHeaders As Range
+    Dim sumHeaders As Range
+    Dim cell As Range
+    Dim srcWs As Worksheet
+    Dim srcWb As Workbook
+    Dim outWs As Worksheet
+    Dim dict As Object
+    Dim data As Variant
+    Dim outData As Variant
+    Dim rec As Variant
+    Dim newRec() As Variant
+    Dim dictKeys As Variant
+    Dim keyCols() As Long
+    Dim sumCols() As Long
+    Dim keyNames() As String
+    Dim sumNames() As String
+    Dim headerRow As Long
+    Dim lastRow As Long
+    Dim lastCol As Long
+    Dim keyCount As Long
+    Dim sumCount As Long
+    Dim rowIndex As Long
+    Dim colIndex As Long
+    Dim outRow As Long
+    Dim groupKey As String
+    Dim processedRows As Long
+    Dim ignoredValueCount As Long
+    Dim resultMessage As String
+    Dim oldScreenUpdating As Boolean
+    Dim oldEnableEvents As Boolean
+    Dim oldDisplayAlerts As Boolean
+    Dim oldCalculation As XlCalculation
+    Dim stateChanged As Boolean
+    Dim errorNumber As Long
+    Dim errorDescription As String
+
+    On Error GoTo ErrorHandler
+
+    Set keyHeaders = PromptForHeaderCells( _
+        "キーにする見出しセルを選択してください。" & vbCrLf & _
+        "複数選ぶ場合は Ctrl を押しながら選択します。", _
+        "グループ化キーの選択")
+
+    If keyHeaders Is Nothing Then Exit Sub
+
+    Set srcWs = keyHeaders.Worksheet
+    Set srcWb = srcWs.Parent
+    headerRow = keyHeaders.Cells(1, 1).Row
+    lastRow = LastDataRow(srcWs)
+    lastCol = LastDataCol(srcWs)
+
+    If Not ValidateHeaderSelection(keyHeaders, srcWs, headerRow, lastCol, "キー") Then Exit Sub
+
+    Set sumHeaders = PromptForHeaderCells( _
+        "合計したい見出しセルを選択してください。" & vbCrLf & _
+        "複数選ぶ場合は Ctrl を押しながら選択します。", _
+        "合計列の選択")
+
+    If sumHeaders Is Nothing Then Exit Sub
+
+    If Not ValidateHeaderSelection(sumHeaders, srcWs, headerRow, lastCol, "合計") Then Exit Sub
+
+    For Each cell In sumHeaders.Cells
+        If Not Application.Intersect(cell, keyHeaders) Is Nothing Then
+            MsgBox "同じ見出しをキー列と合計列の両方には指定できません。" & vbCrLf & _
+                   "対象: " & cell.Address(False, False), vbExclamation
+            Exit Sub
+        End If
+    Next cell
+
+    If lastRow <= headerRow Then
+        MsgBox "見出し行の下に集計対象データがありません。", vbExclamation
+        Exit Sub
+    End If
+
+    keyCount = CLng(keyHeaders.Cells.CountLarge)
+    sumCount = CLng(sumHeaders.Cells.CountLarge)
+    ReDim keyCols(1 To keyCount)
+    ReDim sumCols(1 To sumCount)
+    ReDim keyNames(1 To keyCount)
+    ReDim sumNames(1 To sumCount)
+
+    colIndex = 0
+    For Each cell In keyHeaders.Cells
+        colIndex = colIndex + 1
+        keyCols(colIndex) = cell.Column
+        keyNames(colIndex) = CStr(cell.Value2)
+    Next cell
+
+    colIndex = 0
+    For Each cell In sumHeaders.Cells
+        colIndex = colIndex + 1
+        sumCols(colIndex) = cell.Column
+        sumNames(colIndex) = CStr(cell.Value2)
+    Next cell
+
+    oldScreenUpdating = Application.ScreenUpdating
+    oldEnableEvents = Application.EnableEvents
+    oldDisplayAlerts = Application.DisplayAlerts
+    oldCalculation = Application.Calculation
+    stateChanged = True
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+    data = srcWs.Range(srcWs.Cells(headerRow, 1), srcWs.Cells(lastRow, lastCol)).Value2
+
+    Set dict = CreateObject("Scripting.Dictionary")
+    dict.CompareMode = vbTextCompare
+
+    For rowIndex = 2 To UBound(data, 1)
+        If ArrayRowHasData(data, rowIndex, lastCol) Then
+            groupKey = BuildCompositeKey(data, rowIndex, keyCols)
+
+            For colIndex = 1 To sumCount
+                If IsNonBlankNonNumeric(data(rowIndex, sumCols(colIndex))) Then
+                    ignoredValueCount = ignoredValueCount + 1
+                End If
+            Next colIndex
+
+            If dict.exists(groupKey) Then
+                rec = dict(groupKey)
+                For colIndex = 1 To sumCount
+                    rec(keyCount + colIndex) = CDbl(rec(keyCount + colIndex)) + _
+                                                     NumericOrZero(data(rowIndex, sumCols(colIndex)))
+                Next colIndex
+                rec(keyCount + sumCount + 1) = CLng(rec(keyCount + sumCount + 1)) + 1
+                dict(groupKey) = rec
+            Else
+                ReDim newRec(1 To keyCount + sumCount + 1)
+
+                For colIndex = 1 To keyCount
+                    newRec(colIndex) = data(rowIndex, keyCols(colIndex))
+                Next colIndex
+
+                For colIndex = 1 To sumCount
+                    newRec(keyCount + colIndex) = NumericOrZero(data(rowIndex, sumCols(colIndex)))
+                Next colIndex
+
+                newRec(keyCount + sumCount + 1) = 1
+                dict.Add groupKey, newRec
+            End If
+
+            processedRows = processedRows + 1
+        End If
+    Next rowIndex
+
+    If dict.Count = 0 Then
+        RestoreApplicationState oldScreenUpdating, oldEnableEvents, oldDisplayAlerts, oldCalculation, stateChanged
+        MsgBox "集計対象となるデータ行がありません。", vbExclamation
+        Exit Sub
+    End If
+
+    ReDim outData(1 To dict.Count + 1, 1 To keyCount + sumCount + 1)
+
+    For colIndex = 1 To keyCount
+        outData(1, colIndex) = keyNames(colIndex)
+    Next colIndex
+
+    For colIndex = 1 To sumCount
+        outData(1, keyCount + colIndex) = sumNames(colIndex) & "_合計"
+    Next colIndex
+
+    outData(1, keyCount + sumCount + 1) = "件数"
+
+    dictKeys = dict.Keys
+    For outRow = 0 To dict.Count - 1
+        rec = dict(dictKeys(outRow))
+        For colIndex = 1 To keyCount + sumCount + 1
+            outData(outRow + 2, colIndex) = rec(colIndex)
+        Next colIndex
+    Next outRow
+
+    Set outWs = srcWb.Worksheets.Add(After:=srcWb.Worksheets(srcWb.Worksheets.Count))
+    outWs.Name = MakeUniqueSheetName(srcWb, "集計_" & Format$(Now, "mmdd_hhnnss"))
+    outWs.Range("A1").Resize(UBound(outData, 1), UBound(outData, 2)).value = outData
+
+    FormatOutputSheet outWs, UBound(outData, 1), UBound(outData, 2)
+
+    For colIndex = 1 To keyCount
+        outWs.Columns(colIndex).NumberFormatLocal = _
+            srcWs.Cells(headerRow + 1, keyCols(colIndex)).NumberFormatLocal
+    Next colIndex
+
+    For colIndex = 1 To sumCount
+        outWs.Columns(keyCount + colIndex).NumberFormatLocal = _
+            srcWs.Cells(headerRow + 1, sumCols(colIndex)).NumberFormatLocal
+    Next colIndex
+
+    outWs.Columns(keyCount + sumCount + 1).numberFormat = "0"
+    SortOutputByFirstColumns outWs, keyCount, dict.Count + 1, keyCount + sumCount + 1
+    SafeAutoFit outWs, keyCount + sumCount + 1
+
+    RestoreApplicationState oldScreenUpdating, oldEnableEvents, oldDisplayAlerts, oldCalculation, stateChanged
+
+    outWs.Activate
+    resultMessage = Format$(processedRows, "#,##0") & "行を、" & _
+                    Format$(dict.Count, "#,##0") & "グループに集計しました。" & vbCrLf & _
+                    "出力先: " & outWs.Name
+
+    If ignoredValueCount > 0 Then
+        resultMessage = resultMessage & vbCrLf & vbCrLf & _
+                        "注意: 合計列にあった数値以外の値 " & _
+                        Format$(ignoredValueCount, "#,##0") & "件は合計から除外しました。"
+    End If
+
+    MsgBox resultMessage, vbInformation
+    Exit Sub
+
+ErrorHandler:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+    RestoreApplicationState oldScreenUpdating, oldEnableEvents, oldDisplayAlerts, oldCalculation, stateChanged
+    MsgBox "グループ集計に失敗しました。" & vbCrLf & _
+           "エラー " & errorNumber & ": " & errorDescription, vbCritical
+
+End Sub
+
+Private Function LastDataRow(ByVal ws As Worksheet) As Long
+
+    Dim foundCell As Range
+
+    On Error Resume Next
+    Set foundCell = ws.Cells.Find( _
+                        What:="*", _
+                        After:=ws.Cells(1, 1), _
+                        LookIn:=xlFormulas, _
+                        LookAt:=xlPart, _
+                        SearchOrder:=xlByRows, _
+                        SearchDirection:=xlPrevious, _
+                        MatchCase:=False, _
+                        MatchByte:=False, _
+                        SearchFormat:=False)
+    On Error GoTo 0
+
+    If foundCell Is Nothing Then
+        LastDataRow = 0
+    Else
+        LastDataRow = foundCell.Row
+    End If
+
+End Function
+
+Private Function LastDataCol(ByVal ws As Worksheet) As Long
+
+    Dim foundCell As Range
+
+    On Error Resume Next
+    Set foundCell = ws.Cells.Find( _
+                        What:="*", _
+                        After:=ws.Cells(1, 1), _
+                        LookIn:=xlFormulas, _
+                        LookAt:=xlPart, _
+                        SearchOrder:=xlByColumns, _
+                        SearchDirection:=xlPrevious, _
+                        MatchCase:=False, _
+                        MatchByte:=False, _
+                        SearchFormat:=False)
+    On Error GoTo 0
+
+    If foundCell Is Nothing Then
+        LastDataCol = 0
+    Else
+        LastDataCol = foundCell.Column
+    End If
+
+End Function
+
+Private Function PromptForHeaderCells( _
+    ByVal promptText As String, _
+    ByVal titleText As String) As Range
+
+    On Error Resume Next
+    Set PromptForHeaderCells = Application.InputBox( _
+                                    Prompt:=promptText, _
+                                    Title:=titleText, _
+                                    Type:=8)
+    On Error GoTo 0
+
+End Function
+
+Private Function ValidateHeaderSelection( _
+    ByVal selectedHeaders As Range, _
+    ByVal expectedWs As Worksheet, _
+    ByVal expectedRow As Long, _
+    ByVal lastCol As Long, _
+    ByVal selectionName As String) As Boolean
+
+    Dim cell As Range
+
+    If Not selectedHeaders.Worksheet Is expectedWs Then
+        MsgBox selectionName & "の見出しは、元データと同じシートから選択してください。", vbExclamation
+        Exit Function
+    End If
+
+    For Each cell In selectedHeaders.Cells
+        If cell.Row <> expectedRow Then
+            MsgBox selectionName & "の見出しは、すべて同じ行から選択してください。" & vbCrLf & _
+                   "見出し行: " & expectedRow & "行目", vbExclamation
+            Exit Function
+        End If
+
+        If cell.Column > lastCol Then
+            MsgBox selectionName & "にデータ範囲外のセルが含まれています。", vbExclamation
+            Exit Function
+        End If
+
+        If IsError(cell.value) Then
+            MsgBox selectionName & "にエラーの見出しが含まれています。" & vbCrLf & _
+                   "対象: " & cell.Address(False, False), vbExclamation
+            Exit Function
+        End If
+
+        If Len(Trim$(CStr(cell.Value2))) = 0 Then
+            MsgBox selectionName & "に空白またはエラーの見出しが含まれています。" & vbCrLf & _
+                   "対象: " & cell.Address(False, False), vbExclamation
+            Exit Function
+        End If
+    Next cell
+
+    ValidateHeaderSelection = True
+
+End Function
+
+Private Function BuildCompositeKey( _
+    ByRef data As Variant, _
+    ByVal rowIndex As Long, _
+    ByRef keyCols() As Long) As String
+
+    Dim keyIndex As Long
+    Dim part As String
+    Dim result As String
+
+    For keyIndex = LBound(keyCols) To UBound(keyCols)
+        part = SerializeKeyValue(data(rowIndex, keyCols(keyIndex)))
+        result = result & CStr(Len(part)) & ":" & part
+    Next keyIndex
+
+    BuildCompositeKey = result
+
+End Function
+
+Private Function SerializeKeyValue(ByVal value As Variant) As String
+
+    If IsError(value) Then
+        SerializeKeyValue = "E:#ERROR"
+    ElseIf IsEmpty(value) Then
+        SerializeKeyValue = "Z:"
+    Else
+        Select Case VarType(value)
+            Case vbString
+                SerializeKeyValue = "S:" & CStr(value)
+            Case vbBoolean
+                If CBool(value) Then
+                    SerializeKeyValue = "B:TRUE"
+                Else
+                    SerializeKeyValue = "B:FALSE"
+                End If
+            Case vbDate
+                SerializeKeyValue = "D:" & Format$(CDbl(CDate(value)), "0.###############")
+            Case Else
+                If IsNumeric(value) Then
+                    SerializeKeyValue = "N:" & Format$(CDbl(value), "0.###############")
+                Else
+                    SerializeKeyValue = "O:" & CStr(value)
+                End If
+        End Select
+    End If
+
+End Function
+
+Private Function NumericOrZero(ByVal value As Variant) As Double
+
+    If IsError(value) Or IsEmpty(value) Then Exit Function
+    If VarType(value) = vbString And Len(Trim$(CStr(value))) = 0 Then Exit Function
+
+    If IsNumeric(value) Then NumericOrZero = CDbl(value)
+
+End Function
+
+Private Function IsNonBlankNonNumeric(ByVal value As Variant) As Boolean
+
+    If IsError(value) Then
+        IsNonBlankNonNumeric = True
+        Exit Function
+    End If
+
+    If IsEmpty(value) Then Exit Function
+
+    If VarType(value) = vbString Then
+        If Len(Trim$(CStr(value))) = 0 Then Exit Function
+    End If
+
+    IsNonBlankNonNumeric = Not IsNumeric(value)
+
+End Function
+
+Private Function ArrayRowHasData( _
+    ByRef data As Variant, _
+    ByVal rowIndex As Long, _
+    ByVal lastCol As Long) As Boolean
+
+    Dim colIndex As Long
+    Dim value As Variant
+
+    For colIndex = 1 To lastCol
+        value = data(rowIndex, colIndex)
+
+        If IsError(value) Then
+            ArrayRowHasData = True
+            Exit Function
+        ElseIf Not IsEmpty(value) Then
+            If VarType(value) <> vbString Or Len(CStr(value)) > 0 Then
+                ArrayRowHasData = True
+                Exit Function
+            End If
+        End If
+    Next colIndex
+
+End Function
+
+Private Sub FormatOutputSheet( _
+    ByVal ws As Worksheet, _
+    ByVal rowCount As Long, _
+    ByVal colCount As Long)
+
+    Dim outputRange As Range
+
+    Set outputRange = ws.Range("A1").Resize(rowCount, colCount)
+
+    With outputRange.Rows(1)
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .Interior.Color = RGB(31, 78, 121)
+    End With
+
+    outputRange.AutoFilter
+
+End Sub
+
+Private Sub SortOutputByFirstColumns( _
+    ByVal ws As Worksheet, _
+    ByVal keyCount As Long, _
+    ByVal rowCount As Long, _
+    ByVal colCount As Long)
+
+    Dim keyIndex As Long
+
+    If rowCount <= 2 Then Exit Sub
+
+    On Error GoTo SortFailed
+
+    With ws.Sort
+        .SortFields.Clear
+
+        For keyIndex = 1 To keyCount
+            .SortFields.Add _
+                Key:=ws.Range(ws.Cells(2, keyIndex), ws.Cells(rowCount, keyIndex)), _
+                SortOn:=xlSortOnValues, _
+                Order:=xlAscending, _
+                DataOption:=xlSortNormal
+        Next keyIndex
+
+        .SetRange ws.Range(ws.Cells(1, 1), ws.Cells(rowCount, colCount))
+        .Header = xlYes
+        .MatchCase = False
+        .Orientation = xlTopToBottom
+        .Apply
+    End With
+
+    Exit Sub
+
+SortFailed:
+    On Error Resume Next
+    ws.Sort.SortFields.Clear
+    On Error GoTo 0
+
+End Sub
+
+Private Sub SafeAutoFit(ByVal ws As Worksheet, ByVal lastCol As Long)
+
+    Dim colIndex As Long
+
+    If lastCol < 1 Then Exit Sub
+
+    ws.Range(ws.Columns(1), ws.Columns(lastCol)).EntireColumn.AutoFit
+
+    For colIndex = 1 To lastCol
+        If ws.Columns(colIndex).ColumnWidth > 50 Then
+            ws.Columns(colIndex).ColumnWidth = 50
+        End If
+    Next colIndex
+
+End Sub
+
+Private Function CleanSheetName(ByVal proposedName As String) As String
+
+    Dim invalidChars As Variant
+    Dim item As Variant
+
+    invalidChars = Array("\", "/", ":", "*", "?", "[", "]")
+
+    For Each item In invalidChars
+        proposedName = Replace$(proposedName, CStr(item), "_")
+    Next item
+
+    proposedName = Trim$(proposedName)
+    If Len(proposedName) = 0 Then proposedName = "CSV取込"
+
+    CleanSheetName = Left$(proposedName, 31)
+
+End Function
+
+Private Function MakeUniqueSheetName( _
+    ByVal wb As Workbook, _
+    ByVal baseName As String) As String
+
+    Dim candidate As String
+    Dim suffix As Long
+    Dim suffixText As String
+
+    baseName = CleanSheetName(baseName)
+    candidate = baseName
+
+    Do While SheetExists(wb, candidate)
+        suffix = suffix + 1
+        suffixText = "_" & CStr(suffix)
+        candidate = Left$(baseName, 31 - Len(suffixText)) & suffixText
+    Loop
+
+    MakeUniqueSheetName = candidate
+
+End Function
+
+Private Function SheetExists(ByVal wb As Workbook, ByVal sheetName As String) As Boolean
+
+    Dim ws As Object
+
+    On Error Resume Next
+    Set ws = wb.Sheets(sheetName)
+    SheetExists = Not ws Is Nothing
+    On Error GoTo 0
+
+End Function
+
+Private Sub RestoreApplicationState( _
+    ByVal oldScreenUpdating As Boolean, _
+    ByVal oldEnableEvents As Boolean, _
+    ByVal oldDisplayAlerts As Boolean, _
+    ByVal oldCalculation As XlCalculation, _
+    ByVal stateChanged As Boolean)
+
+    If Not stateChanged Then Exit Sub
+
+    On Error Resume Next
+    Application.ScreenUpdating = oldScreenUpdating
+    Application.EnableEvents = oldEnableEvents
+    Application.DisplayAlerts = oldDisplayAlerts
+    Application.Calculation = oldCalculation
+    On Error GoTo 0
+
+End Sub
