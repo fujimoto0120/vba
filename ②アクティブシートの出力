@@ -1,0 +1,223 @@
+Option Explicit
+
+Private Const CP_UTF8 As Long = 65001
+Private Const CP_SHIFT_JIS As Long = 932
+Private Const FILE_FORMAT_CSV_UTF8 As Long = 62
+Private Const FILE_FORMAT_CSV As Long = 6
+
+Public Sub アクティブシートをCSV出力()
+
+    Dim srcWs As Worksheet
+    Dim tempWb As Workbook
+    Dim tempWs As Worksheet
+    Dim srcRange As Range
+    Dim dstRange As Range
+    Dim savePath As Variant
+    Dim outputPath As String
+    Dim initialName As String
+    Dim codePage As Long
+    Dim fileFormat As Long
+    Dim lastRow As Long
+    Dim lastCol As Long
+    Dim oldScreenUpdating As Boolean
+    Dim oldEnableEvents As Boolean
+    Dim oldDisplayAlerts As Boolean
+    Dim oldCalculation As XlCalculation
+    Dim stateChanged As Boolean
+    Dim errorNumber As Long
+    Dim errorDescription As String
+
+    On Error GoTo ErrorHandler
+
+    If TypeName(ActiveSheet) <> "Worksheet" Then
+        MsgBox "CSVへ出力するワークシートを開いてから実行してください。", vbExclamation
+        Exit Sub
+    End If
+
+    Set srcWs = ActiveSheet
+    lastRow = LastDataRow(srcWs)
+    lastCol = LastDataCol(srcWs)
+
+    If lastRow = 0 Or lastCol = 0 Then
+        MsgBox "アクティブシートに出力対象のデータがありません。", vbExclamation
+        Exit Sub
+    End If
+
+    initialName = srcWs.Name & "_" & Format$(Now, "yyyymmdd_hhnnss") & ".csv"
+    savePath = Application.GetSaveAsFilename( _
+                    InitialFileName:=initialName, _
+                    FileFilter:="CSVファイル (*.csv),*.csv", _
+                    Title:="CSVの保存先を指定してください")
+
+    If VarType(savePath) = vbBoolean Then Exit Sub
+    outputPath = EnsureCsvExtension(CStr(savePath))
+
+    If FileExists(outputPath) Then
+        If MsgBox("同名のファイルが既にあります。上書きしますか？" & vbCrLf & outputPath, _
+                  vbYesNo + vbExclamation, "上書き確認") <> vbYes Then
+            Exit Sub
+        End If
+    End If
+
+    codePage = AskCsvEncoding("CSV出力")
+    If codePage = 0 Then Exit Sub
+
+    If codePage = CP_UTF8 Then
+        fileFormat = FILE_FORMAT_CSV_UTF8
+    Else
+        fileFormat = FILE_FORMAT_CSV
+    End If
+
+    oldScreenUpdating = Application.ScreenUpdating
+    oldEnableEvents = Application.EnableEvents
+    oldDisplayAlerts = Application.DisplayAlerts
+    oldCalculation = Application.Calculation
+    stateChanged = True
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+    Set srcRange = srcWs.Range(srcWs.Cells(1, 1), srcWs.Cells(lastRow, lastCol))
+    Set tempWb = Workbooks.Add(xlWBATWorksheet)
+    Set tempWs = tempWb.Worksheets(1)
+    Set dstRange = tempWs.Range("A1").Resize(srcRange.Rows.Count, srcRange.Columns.Count)
+
+    srcRange.Copy
+    dstRange.PasteSpecial Paste:=xlPasteValuesAndNumberFormats
+    Application.CutCopyMode = False
+
+    tempWb.SaveAs fileName:=outputPath, _
+                      fileFormat:=fileFormat, _
+                      CreateBackup:=False, _
+                      Local:=True
+    tempWb.Close SaveChanges:=False
+    Set tempWb = Nothing
+
+    RestoreApplicationState oldScreenUpdating, oldEnableEvents, oldDisplayAlerts, oldCalculation, stateChanged
+
+    MsgBox "CSVを出力しました。" & vbCrLf & outputPath, vbInformation
+    Exit Sub
+
+ErrorHandler:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+    On Error Resume Next
+    Application.CutCopyMode = False
+    If Not tempWb Is Nothing Then tempWb.Close SaveChanges:=False
+    RestoreApplicationState oldScreenUpdating, oldEnableEvents, oldDisplayAlerts, oldCalculation, stateChanged
+    On Error GoTo 0
+    MsgBox "CSVの出力に失敗しました。" & vbCrLf & _
+           "エラー " & errorNumber & ": " & errorDescription, vbCritical
+
+End Sub
+
+Private Function LastDataRow(ByVal ws As Worksheet) As Long
+
+    Dim foundCell As Range
+
+    On Error Resume Next
+    Set foundCell = ws.Cells.Find( _
+                        What:="*", _
+                        After:=ws.Cells(1, 1), _
+                        LookIn:=xlFormulas, _
+                        LookAt:=xlPart, _
+                        SearchOrder:=xlByRows, _
+                        SearchDirection:=xlPrevious, _
+                        MatchCase:=False, _
+                        MatchByte:=False, _
+                        SearchFormat:=False)
+    On Error GoTo 0
+
+    If foundCell Is Nothing Then
+        LastDataRow = 0
+    Else
+        LastDataRow = foundCell.Row
+    End If
+
+End Function
+
+Private Function LastDataCol(ByVal ws As Worksheet) As Long
+
+    Dim foundCell As Range
+
+    On Error Resume Next
+    Set foundCell = ws.Cells.Find( _
+                        What:="*", _
+                        After:=ws.Cells(1, 1), _
+                        LookIn:=xlFormulas, _
+                        LookAt:=xlPart, _
+                        SearchOrder:=xlByColumns, _
+                        SearchDirection:=xlPrevious, _
+                        MatchCase:=False, _
+                        MatchByte:=False, _
+                        SearchFormat:=False)
+    On Error GoTo 0
+
+    If foundCell Is Nothing Then
+        LastDataCol = 0
+    Else
+        LastDataCol = foundCell.Column
+    End If
+
+End Function
+
+Private Function AskCsvEncoding(ByVal titleText As String) As Long
+
+    Dim answer As VbMsgBoxResult
+
+    answer = MsgBox( _
+        "CSVの文字コードを選択してください。" & vbCrLf & vbCrLf & _
+        "［はい］  UTF-8（推奨）" & vbCrLf & _
+        "［いいえ］Shift-JIS（日本語Windows向け）" & vbCrLf & _
+        "［キャンセル］処理を中止する", _
+        vbYesNoCancel + vbQuestion, _
+        titleText & "：文字コード")
+
+    Select Case answer
+        Case vbYes
+            AskCsvEncoding = CP_UTF8
+        Case vbNo
+            AskCsvEncoding = CP_SHIFT_JIS
+        Case Else
+            AskCsvEncoding = 0
+    End Select
+
+End Function
+
+Private Function EnsureCsvExtension(ByVal filePath As String) As String
+
+    If LCase$(Right$(filePath, 4)) = ".csv" Then
+        EnsureCsvExtension = filePath
+    Else
+        EnsureCsvExtension = filePath & ".csv"
+    End If
+
+End Function
+
+Private Function FileExists(ByVal filePath As String) As Boolean
+
+    On Error Resume Next
+    FileExists = (Len(Dir$(filePath, vbNormal Or vbHidden Or vbSystem Or vbReadOnly)) > 0)
+    On Error GoTo 0
+
+End Function
+
+Private Sub RestoreApplicationState( _
+    ByVal oldScreenUpdating As Boolean, _
+    ByVal oldEnableEvents As Boolean, _
+    ByVal oldDisplayAlerts As Boolean, _
+    ByVal oldCalculation As XlCalculation, _
+    ByVal stateChanged As Boolean)
+
+    If Not stateChanged Then Exit Sub
+
+    On Error Resume Next
+    Application.ScreenUpdating = oldScreenUpdating
+    Application.EnableEvents = oldEnableEvents
+    Application.DisplayAlerts = oldDisplayAlerts
+    Application.Calculation = oldCalculation
+    On Error GoTo 0
+
+End Sub
