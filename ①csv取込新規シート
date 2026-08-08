@@ -1,0 +1,462 @@
+Option Explicit
+
+Private Const CP_UTF8 As Long = 65001
+Private Const CP_SHIFT_JIS As Long = 932
+Private Const AD_READ_LINE As Long = -2
+Private Const AD_LF As Long = 10
+
+Public Sub CSVを新規シートへ取込()
+
+    Dim hostWb As Workbook
+    Dim csvWb As Workbook
+    Dim csvWs As Worksheet
+    Dim newWs As Worksheet
+    Dim srcRange As Range
+    Dim dstRange As Range
+
+    Dim filePath As Variant
+    Dim codePage As Long
+    Dim importChoice As VbMsgBoxResult
+    Dim importAsText As Boolean
+
+    Dim lastRow As Long
+    Dim lastCol As Long
+
+    Dim oldScreenUpdating As Boolean
+    Dim oldEnableEvents As Boolean
+    Dim oldDisplayAlerts As Boolean
+    Dim oldCalculation As XlCalculation
+    Dim stateChanged As Boolean
+
+    Dim importSucceeded As Boolean
+    Dim errorNumber As Long
+    Dim errorDescription As String
+
+    On Error GoTo ErrorHandler
+
+    Set hostWb = ActiveWorkbook
+
+    If hostWb Is Nothing Then
+        MsgBox "取込先のブックを開いてから実行してください。", vbExclamation
+        Exit Sub
+    End If
+
+    filePath = Application.GetOpenFilename( _
+                    FileFilter:="CSVファイル (*.csv),*.csv", _
+                    Title:="取り込むCSVを選択してください")
+
+    If VarType(filePath) = vbBoolean Then Exit Sub
+
+    codePage = AskCsvEncoding("CSV取込")
+    If codePage = 0 Then Exit Sub
+
+    importChoice = MsgBox( _
+        "品番・伝票番号などの先頭ゼロを残す場合は［はい］を選んでください。" & _
+        vbCrLf & vbCrLf & _
+        "［はい］  全列を文字列として取り込む" & vbCrLf & _
+        "［いいえ］Excelに数値・日付を自動判定させる" & vbCrLf & _
+        "［キャンセル］処理を中止する", _
+        vbYesNoCancel + vbQuestion, _
+        "取込時のデータ型")
+
+    If importChoice = vbCancel Then Exit Sub
+    importAsText = (importChoice = vbYes)
+
+    'Excelの現在の状態を保存
+    oldScreenUpdating = Application.ScreenUpdating
+    oldEnableEvents = Application.EnableEvents
+    oldDisplayAlerts = Application.DisplayAlerts
+    oldCalculation = Application.Calculation
+    stateChanged = True
+
+    '取込中の画面更新、イベント、再計算などを停止
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+    Set csvWb = OpenCsvAsWorkbook( _
+                    CStr(filePath), _
+                    codePage, _
+                    importAsText)
+
+    Set csvWs = csvWb.Worksheets(1)
+
+    Set newWs = hostWb.Worksheets.Add( _
+                    After:=hostWb.Worksheets(hostWb.Worksheets.Count))
+
+    newWs.Name = MakeUniqueSheetName( _
+                        hostWb, _
+                        CleanSheetName(GetFileBaseName(CStr(filePath))))
+
+    lastRow = LastDataRow(csvWs)
+    lastCol = LastDataCol(csvWs)
+
+    If lastRow > 0 And lastCol > 0 Then
+
+        Set srcRange = csvWs.Range( _
+                            csvWs.Cells(1, 1), _
+                            csvWs.Cells(lastRow, lastCol))
+
+        Set dstRange = newWs.Range("A1").Resize( _
+                            srcRange.Rows.Count, _
+                            srcRange.Columns.Count)
+
+        srcRange.Copy
+        dstRange.PasteSpecial Paste:=xlPasteValuesAndNumberFormats
+        Application.CutCopyMode = False
+
+        SafeAutoFit newWs, lastCol
+
+    End If
+
+    importSucceeded = True
+    GoTo Cleanup
+
+ErrorHandler:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+
+Cleanup:
+    On Error Resume Next
+
+    Application.CutCopyMode = False
+
+    If Not csvWb Is Nothing Then
+        csvWb.Close SaveChanges:=False
+        Set csvWb = Nothing
+    End If
+
+    '失敗した場合は、この処理が作成したシートだけを削除
+    If Not importSucceeded Then
+        If Not newWs Is Nothing Then
+            newWs.Delete
+            Set newWs = Nothing
+        End If
+    End If
+
+    RestoreApplicationState _
+        oldScreenUpdating, _
+        oldEnableEvents, _
+        oldDisplayAlerts, _
+        oldCalculation, _
+        stateChanged
+
+    On Error GoTo 0
+
+    If importSucceeded Then
+
+        'シートの選択に失敗しても取込失敗とは扱わない
+        On Error Resume Next
+        hostWb.Activate
+        newWs.Activate
+        On Error GoTo 0
+
+        MsgBox _
+            "CSVをシート「" & newWs.Name & "」へ取り込みました。", _
+            vbInformation
+
+    Else
+
+        MsgBox _
+            "CSVの取込に失敗しました。" & vbCrLf & _
+            "エラー " & errorNumber & ": " & errorDescription, _
+            vbCritical
+
+    End If
+
+End Sub
+
+Private Function LastDataRow(ByVal ws As Worksheet) As Long
+
+    Dim foundCell As Range
+
+    On Error Resume Next
+    Set foundCell = ws.Cells.Find( _
+                        What:="*", _
+                        After:=ws.Cells(1, 1), _
+                        LookIn:=xlFormulas, _
+                        LookAt:=xlPart, _
+                        SearchOrder:=xlByRows, _
+                        SearchDirection:=xlPrevious, _
+                        MatchCase:=False, _
+                        MatchByte:=False, _
+                        SearchFormat:=False)
+    On Error GoTo 0
+
+    If foundCell Is Nothing Then
+        LastDataRow = 0
+    Else
+        LastDataRow = foundCell.Row
+    End If
+
+End Function
+
+Private Function LastDataCol(ByVal ws As Worksheet) As Long
+
+    Dim foundCell As Range
+
+    On Error Resume Next
+    Set foundCell = ws.Cells.Find( _
+                        What:="*", _
+                        After:=ws.Cells(1, 1), _
+                        LookIn:=xlFormulas, _
+                        LookAt:=xlPart, _
+                        SearchOrder:=xlByColumns, _
+                        SearchDirection:=xlPrevious, _
+                        MatchCase:=False, _
+                        MatchByte:=False, _
+                        SearchFormat:=False)
+    On Error GoTo 0
+
+    If foundCell Is Nothing Then
+        LastDataCol = 0
+    Else
+        LastDataCol = foundCell.Column
+    End If
+
+End Function
+
+Private Function AskCsvEncoding(ByVal titleText As String) As Long
+
+    Dim answer As VbMsgBoxResult
+
+    answer = MsgBox( _
+        "CSVの文字コードを選択してください。" & vbCrLf & vbCrLf & _
+        "［はい］  UTF-8（推奨）" & vbCrLf & _
+        "［いいえ］Shift-JIS（日本語Windows向け）" & vbCrLf & _
+        "［キャンセル］処理を中止する", _
+        vbYesNoCancel + vbQuestion, _
+        titleText & "：文字コード")
+
+    Select Case answer
+        Case vbYes
+            AskCsvEncoding = CP_UTF8
+        Case vbNo
+            AskCsvEncoding = CP_SHIFT_JIS
+        Case Else
+            AskCsvEncoding = 0
+    End Select
+
+End Function
+
+Private Function OpenCsvAsWorkbook( _
+    ByVal filePath As String, _
+    ByVal codePage As Long, _
+    ByVal importAsText As Boolean) As Workbook
+
+    Dim fieldInfo() As Variant
+    Dim fieldCount As Long
+    Dim colIndex As Long
+
+    If importAsText Then
+        fieldCount = CountCsvFields(ReadFirstCsvLine(filePath, codePage))
+        If fieldCount < 1 Then fieldCount = 1
+
+        ReDim fieldInfo(0 To fieldCount - 1)
+        For colIndex = 0 To fieldCount - 1
+            fieldInfo(colIndex) = Array(colIndex + 1, xlTextFormat)
+        Next colIndex
+
+        Workbooks.OpenText _
+            fileName:=filePath, _
+            Origin:=codePage, _
+            StartRow:=1, _
+            DataType:=xlDelimited, _
+            TextQualifier:=xlTextQualifierDoubleQuote, _
+            ConsecutiveDelimiter:=False, _
+            Tab:=False, _
+            Semicolon:=False, _
+            Comma:=True, _
+            Space:=False, _
+            Other:=False, _
+            fieldInfo:=fieldInfo, _
+            TrailingMinusNumbers:=True, _
+            Local:=True
+    Else
+        Workbooks.OpenText _
+            fileName:=filePath, _
+            Origin:=codePage, _
+            StartRow:=1, _
+            DataType:=xlDelimited, _
+            TextQualifier:=xlTextQualifierDoubleQuote, _
+            ConsecutiveDelimiter:=False, _
+            Tab:=False, _
+            Semicolon:=False, _
+            Comma:=True, _
+            Space:=False, _
+            Other:=False, _
+            TrailingMinusNumbers:=True, _
+            Local:=True
+    End If
+
+    Set OpenCsvAsWorkbook = ActiveWorkbook
+
+End Function
+
+Private Function ReadFirstCsvLine(ByVal filePath As String, ByVal codePage As Long) As String
+
+    Dim stream As Object
+    Dim errorNumber As Long
+    Dim errorDescription As String
+
+    On Error GoTo ErrorHandler
+
+    Set stream = CreateObject("ADODB.Stream")
+    stream.Type = 2
+
+    If codePage = CP_UTF8 Then
+        stream.Charset = "utf-8"
+    Else
+        stream.Charset = "shift_jis"
+    End If
+
+    stream.Open
+    stream.LineSeparator = AD_LF
+    stream.LoadFromFile filePath
+    ReadFirstCsvLine = stream.ReadText(AD_READ_LINE)
+    stream.Close
+    Exit Function
+
+ErrorHandler:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+    On Error Resume Next
+    If Not stream Is Nothing Then stream.Close
+    On Error GoTo 0
+    Err.Raise vbObjectError + 2101, "ReadFirstCsvLine", _
+              "CSVの先頭行を読み取れませんでした。" & vbCrLf & _
+              "元エラー " & errorNumber & ": " & errorDescription
+
+End Function
+
+Private Function CountCsvFields(ByVal firstLine As String) As Long
+
+    Dim charIndex As Long
+    Dim fieldCount As Long
+    Dim inQuotes As Boolean
+    Dim currentChar As String
+
+    fieldCount = 1
+    charIndex = 1
+
+    Do While charIndex <= Len(firstLine)
+        currentChar = Mid$(firstLine, charIndex, 1)
+
+        If currentChar = """" Then
+            If inQuotes And charIndex < Len(firstLine) And _
+               Mid$(firstLine, charIndex + 1, 1) = """" Then
+                charIndex = charIndex + 1
+            Else
+                inQuotes = Not inQuotes
+            End If
+        ElseIf currentChar = "," And Not inQuotes Then
+            fieldCount = fieldCount + 1
+        End If
+
+        charIndex = charIndex + 1
+    Loop
+
+    CountCsvFields = fieldCount
+
+End Function
+
+Private Sub SafeAutoFit(ByVal ws As Worksheet, ByVal lastCol As Long)
+
+    Dim colIndex As Long
+
+    If lastCol < 1 Then Exit Sub
+
+    ws.Range(ws.Columns(1), ws.Columns(lastCol)).EntireColumn.AutoFit
+
+    For colIndex = 1 To lastCol
+        If ws.Columns(colIndex).ColumnWidth > 50 Then
+            ws.Columns(colIndex).ColumnWidth = 50
+        End If
+    Next colIndex
+
+End Sub
+
+Private Function GetFileBaseName(ByVal filePath As String) As String
+
+    Dim fileName As String
+    Dim dotPosition As Long
+
+    fileName = Mid$(filePath, InStrRev(filePath, Application.PathSeparator) + 1)
+    dotPosition = InStrRev(fileName, ".")
+
+    If dotPosition > 1 Then
+        GetFileBaseName = Left$(fileName, dotPosition - 1)
+    Else
+        GetFileBaseName = fileName
+    End If
+
+End Function
+
+Private Function CleanSheetName(ByVal proposedName As String) As String
+
+    Dim invalidChars As Variant
+    Dim item As Variant
+
+    invalidChars = Array("\", "/", ":", "*", "?", "[", "]")
+
+    For Each item In invalidChars
+        proposedName = Replace$(proposedName, CStr(item), "_")
+    Next item
+
+    proposedName = Trim$(proposedName)
+    If Len(proposedName) = 0 Then proposedName = "CSV取込"
+
+    CleanSheetName = Left$(proposedName, 31)
+
+End Function
+
+Private Function MakeUniqueSheetName( _
+    ByVal wb As Workbook, _
+    ByVal baseName As String) As String
+
+    Dim candidate As String
+    Dim suffix As Long
+    Dim suffixText As String
+
+    baseName = CleanSheetName(baseName)
+    candidate = baseName
+
+    Do While SheetExists(wb, candidate)
+        suffix = suffix + 1
+        suffixText = "_" & CStr(suffix)
+        candidate = Left$(baseName, 31 - Len(suffixText)) & suffixText
+    Loop
+
+    MakeUniqueSheetName = candidate
+
+End Function
+
+Private Function SheetExists(ByVal wb As Workbook, ByVal sheetName As String) As Boolean
+
+    Dim ws As Object
+
+    On Error Resume Next
+    Set ws = wb.Sheets(sheetName)
+    SheetExists = Not ws Is Nothing
+    On Error GoTo 0
+
+End Function
+
+Private Sub RestoreApplicationState( _
+    ByVal oldScreenUpdating As Boolean, _
+    ByVal oldEnableEvents As Boolean, _
+    ByVal oldDisplayAlerts As Boolean, _
+    ByVal oldCalculation As XlCalculation, _
+    ByVal stateChanged As Boolean)
+
+    If Not stateChanged Then Exit Sub
+
+    On Error Resume Next
+    Application.ScreenUpdating = oldScreenUpdating
+    Application.EnableEvents = oldEnableEvents
+    Application.DisplayAlerts = oldDisplayAlerts
+    Application.Calculation = oldCalculation
+    On Error GoTo 0
+
+End Sub
