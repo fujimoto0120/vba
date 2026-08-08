@@ -1,0 +1,88 @@
+Option Explicit
+
+Private Const REFRESH_TIMEOUT_SECONDS As Long = 600
+
+Public Sub 全データ更新して完了待機()
+
+    Dim wb As Workbook
+    Dim startedAt As Date
+    Dim errorNumber As Long
+    Dim errorDescription As String
+
+    On Error GoTo ErrorHandler
+
+    Set wb = ActiveWorkbook
+    If wb Is Nothing Then
+        MsgBox "更新対象のブックを開いてから実行してください。", vbExclamation
+        Exit Sub
+    End If
+
+    startedAt = Now
+    Application.StatusBar = "データを更新しています…"
+
+    wb.RefreshAll
+
+    On Error Resume Next
+    Application.CalculateUntilAsyncQueriesDone
+    On Error GoTo ErrorHandler
+
+    Do While WorkbookHasRefreshingQueries(wb)
+        DoEvents
+        Application.StatusBar = "データを更新しています… 経過 " & _
+                                DateDiff("s", startedAt, Now) & " 秒"
+
+        If DateDiff("s", startedAt, Now) >= REFRESH_TIMEOUT_SECONDS Then
+            Application.StatusBar = False
+            MsgBox "更新開始から10分が経過しました。" & vbCrLf & _
+                   "接続先やクエリの状態を確認してください。", vbExclamation
+            Exit Sub
+        End If
+    Loop
+
+    Application.CalculateFull
+    Application.StatusBar = False
+
+    MsgBox "データ更新が完了しました。" & vbCrLf & _
+           "所要時間: " & DateDiff("s", startedAt, Now) & " 秒", vbInformation
+    Exit Sub
+
+ErrorHandler:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+    Application.StatusBar = False
+    MsgBox "データ更新に失敗しました。" & vbCrLf & _
+           "エラー " & errorNumber & ": " & errorDescription, vbCritical
+
+End Sub
+
+Private Function WorkbookHasRefreshingQueries(ByVal wb As Workbook) As Boolean
+
+    Dim ws As Worksheet
+    Dim QueryTable As QueryTable
+    Dim listObject As listObject
+
+    On Error Resume Next
+
+    For Each ws In wb.Worksheets
+        For Each QueryTable In ws.QueryTables
+            If QueryTable.Refreshing Then
+                WorkbookHasRefreshingQueries = True
+                Exit Function
+            End If
+        Next QueryTable
+
+        For Each listObject In ws.ListObjects
+            Set QueryTable = Nothing
+            Set QueryTable = listObject.QueryTable
+            If Not QueryTable Is Nothing Then
+                If QueryTable.Refreshing Then
+                    WorkbookHasRefreshingQueries = True
+                    Exit Function
+                End If
+            End If
+        Next listObject
+    Next ws
+
+    On Error GoTo 0
+
+End Function
