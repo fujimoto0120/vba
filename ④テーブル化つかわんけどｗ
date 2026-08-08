@@ -1,0 +1,87 @@
+Option Explicit
+
+Public Sub 現在範囲をテーブル化()
+
+    Dim ws As Worksheet
+    Dim dataRange As Range
+    Dim listObject As listObject
+    Dim existingTable As listObject
+    Dim errorNumber As Long
+    Dim errorDescription As String
+
+    On Error GoTo ErrorHandler
+
+    If TypeName(ActiveSheet) <> "Worksheet" Then
+        MsgBox "対象のワークシートを開いてから実行してください。", vbExclamation
+        Exit Sub
+    End If
+
+    Set ws = ActiveSheet
+    Set dataRange = ActiveCell.CurrentRegion
+
+    If Application.WorksheetFunction.CountA(dataRange) = 0 Then
+        MsgBox "表の中のセルを1つ選択してから実行してください。", vbExclamation
+        Exit Sub
+    End If
+
+    For Each existingTable In ws.ListObjects
+        If Not Application.Intersect(dataRange, existingTable.Range) Is Nothing Then
+            MsgBox "選択範囲は既にテーブル「" & existingTable.Name & "」に含まれています。", vbInformation
+            Exit Sub
+        End If
+    Next existingTable
+
+    Set listObject = ws.ListObjects.Add( _
+                            SourceType:=xlSrcRange, _
+                            Source:=dataRange, _
+                            XlListObjectHasHeaders:=xlYes)
+
+    listObject.Name = MakeUniqueTableName(ws.Parent, "tbl_" & Format$(Now, "yyyymmdd_hhnnss"))
+    listObject.TableStyle = "TableStyleMedium2"
+
+    MsgBox "範囲 " & dataRange.Address(False, False) & _
+           " をテーブル化しました。", vbInformation
+    Exit Sub
+
+ErrorHandler:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+    MsgBox "テーブル化に失敗しました。" & vbCrLf & _
+           "エラー " & errorNumber & ": " & errorDescription, vbCritical
+
+End Sub
+
+Private Function MakeUniqueTableName( _
+    ByVal wb As Workbook, _
+    ByVal baseName As String) As String
+
+    Dim ws As Worksheet
+    Dim listObject As listObject
+    Dim candidate As String
+    Dim suffix As Long
+    Dim exists As Boolean
+
+    candidate = baseName
+
+    Do
+        exists = False
+
+        For Each ws In wb.Worksheets
+            For Each listObject In ws.ListObjects
+                If StrComp(listObject.Name, candidate, vbTextCompare) = 0 Then
+                    exists = True
+                    Exit For
+                End If
+            Next listObject
+            If exists Then Exit For
+        Next ws
+
+        If exists Then
+            suffix = suffix + 1
+            candidate = baseName & "_" & CStr(suffix)
+        End If
+    Loop While exists
+
+    MakeUniqueTableName = candidate
+
+End Function
